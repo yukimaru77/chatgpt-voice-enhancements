@@ -2,18 +2,27 @@
 
 /**
  * Installs the ChatGPT Desktop Voice enhancement suite through the Electron
- * main-process
- * Chrome DevTools Protocol endpoint. It does not modify app.asar or any signed
- * application files. The patch lives only until that ChatGPT process exits.
+ * renderer or legacy main-process Chrome DevTools Protocol endpoint. It does
+ * not modify app.asar or any signed application files. The patch lives only
+ * until that ChatGPT process exits.
  *
  * Normal use is through install-chatgpt-voice-enhancements.sh. Direct modes:
  *   node inject-chatgpt-voice-enhancements.mjs <port> <timeout-ms> --validate-only
  *   node inject-chatgpt-voice-enhancements.mjs <port> <timeout-ms> --self-test
  */
 
-import { readFileSync } from "node:fs";
+import { execFileSync, spawn } from "node:child_process";
+import {
+  closeSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import assert from "node:assert/strict";
 import { runInNewContext } from "node:vm";
 
@@ -21,6 +30,7 @@ const inspectorPort = Number.parseInt(process.argv[2] ?? "9333", 10);
 const startupDeadline = Date.now() + Number.parseInt(process.argv[3] ?? "30000", 10);
 const validateOnly = process.argv.includes("--validate-only");
 const selfTest = process.argv.includes("--self-test");
+const rendererDaemon = process.argv.includes("--renderer-daemon");
 const projectVoiceRoutingEnabled =
   process.env.CHATGPT_PROJECT_VOICE_ROUTING?.trim() !== "0";
 const voiceDynamicTools = {
@@ -63,7 +73,24 @@ const projectVoiceRendererTemplate = readFileSync(
   new URL("./chatgpt-voice-renderer-enhancements.js", import.meta.url),
   "utf8",
 );
-const projectVoicePatchVersion = "chatgpt-native-project-voice-breakpoints-v31";
+const projectVoicePatchVersion = "chatgpt-native-project-voice-breakpoints-v32";
+const rendererDaemonDirectory = join(
+  homedir(),
+  "Library",
+  "Application Support",
+  "chatgpt-voice-enhancements",
+);
+const rendererDaemonStatePath = join(
+  rendererDaemonDirectory,
+  `renderer-${inspectorPort}.json`,
+);
+const rendererDaemonLogPath = join(
+  homedir(),
+  "Library",
+  "Logs",
+  "chatgpt-voice-enhancements",
+  `renderer-${inspectorPort}.log`,
+);
 
 function findNativeRealtimeTranscriptNotificationGate(source) {
   const pattern = /handleRealtimeNotification\(([A-Za-z_$][\w$]*),([A-Za-z_$][\w$]*)\)\{if\(!\(this\.conversationId==null\|\|\2\.params\.threadId!==this\.conversationId\)\)switch\(\2\.method\)\{/g;
@@ -88,6 +115,41 @@ function nativeRealtimeTranscriptConditionFor(gate) {
     event +
     ".params) === true && " +
     "(globalThis.__chatgptNativeVoiceCompatibilityState.liveTranscriptNotifications += 1)), false)"
+  );
+}
+
+function findNativeExistingThreadVoiceOpenGuard(source) {
+  const pattern = /workspaceRoots:this\.options\.existingThreadVoiceEnabled\?this\.options\.workspaceRootsForLocalExecution:\[`\/`\][\s\S]{0,500}?if\(!this\.options\.existingThreadVoiceEnabled&&[A-Za-z_$][\w$]*!==`realtime_voice`\)throw Error\(`This thread is not a voice chat`\)/g;
+  const matches = [...source.matchAll(pattern)];
+  return { matchCount: matches.length };
+}
+
+function findNativeVoiceCoordinator(source) {
+  const pattern = /async function ([A-Za-z_$][\w$]*)\(\{scope:[A-Za-z_$][\w$]*,activeCollaborationMode:[A-Za-z_$][\w$]*,activateRealtimeConversation:[A-Za-z_$][\w$]*,agentMode:[A-Za-z_$][\w$]*,currentLocalExecutionCwd:[A-Za-z_$][\w$]*,intent:[A-Za-z_$][\w$]*,memoryPreferences:[A-Za-z_$][\w$]*,onStartError:[A-Za-z_$][\w$]*,permissionProfileId:[A-Za-z_$][\w$]*,(?:projectId:[A-Za-z_$][\w$]*,)?serviceTier:[A-Za-z_$][\w$]*,shouldSendPermissionOverrides:[A-Za-z_$][\w$]*,threadToolsEnabled:[A-Za-z_$][\w$]*,treatment:([A-Za-z_$][\w$]*),workspaceRootsForLocalExecution:[A-Za-z_$][\w$]*\}\)\{try\{/g;
+  const matches = [...source.matchAll(pattern)];
+  if (matches.length !== 1) return { matchCount: matches.length };
+  const match = matches[0];
+  return {
+    breakpointOffset: match.index + match[0].lastIndexOf("try{"),
+    functionName: match[1],
+    matchCount: 1,
+    treatmentVariable: match[2],
+  };
+}
+
+function nativeVoiceCoordinatorConditionFor(coordinator, dynamicTools) {
+  const treatment = coordinator.treatmentVariable;
+  return (
+    "(" +
+    treatment +
+    " = { ..." +
+    treatment +
+    ", existingThreadVoiceEnabled: true, dynamicTools: { ...(" +
+    treatment +
+    ".dynamicTools ?? {}), ..." +
+    JSON.stringify(dynamicTools) +
+    " } }, " +
+    "globalThis.__chatgptNativeVoiceCompatibilityState.coordinatorGateHits += 1, false)"
   );
 }
 
@@ -443,6 +505,7 @@ try {
 const { mode: voiceWorkerMode, model, reasoningEffort } = voiceWorker;
 const hookVersion = "chatgpt-voice-worker-request-v6";
 let activeConnection = null;
+let activeRendererConnections = [];
 let stopping = false;
 const overrideSource = String.raw`
 (() => {
@@ -659,6 +722,9 @@ const projectVoiceInstallerSource = String.raw`
   const version = ${JSON.stringify(projectVoicePatchVersion)};
   const findNativeRealtimeTranscriptNotificationGate = ${findNativeRealtimeTranscriptNotificationGate.toString()};
   const nativeRealtimeTranscriptConditionFor = ${nativeRealtimeTranscriptConditionFor.toString()};
+  const findNativeExistingThreadVoiceOpenGuard = ${findNativeExistingThreadVoiceOpenGuard.toString()};
+  const findNativeVoiceCoordinator = ${findNativeVoiceCoordinator.toString()};
+  const nativeVoiceCoordinatorConditionFor = ${nativeVoiceCoordinatorConditionFor.toString()};
   const findNativeExistingThreadStartCallback = ${findNativeExistingThreadStartCallback.toString()};
   const findNativeExistingThreadHandoff = ${findNativeExistingThreadHandoff.toString()};
   const nativeExistingThreadGateConditionFor = ${nativeExistingThreadGateConditionFor.toString()};
@@ -749,141 +815,159 @@ const projectVoiceInstallerSource = String.raw`
     const realtimeTranscriptCondition = nativeRealtimeTranscriptConditionFor(
       realtimeTranscriptGate,
     );
-    const existingThreadGatePattern = /([A-Za-z_$][\w$]*)=\(([A-Za-z_$][\w$]*)!=null\|\|([A-Za-z_$][\w$]*)&&([A-Za-z_$][\w$]*)!=null\)&&([A-Za-z_$][\w$]*)&&navigator\.mediaDevices\?\.getUserMedia!=null&&typeof RTCPeerConnection<\x60u\x60[\s\S]{0,4200}?return[\s\S]{0,500}?\{isStartAvailable:\1,isSubmitStarting:[\s\S]{0,220}?isVoiceThread:([A-Za-z_$][\w$]*),/g;
-    const existingThreadGateMatches = nativeRendererAssets.flatMap((asset) =>
-      [...asset.source.matchAll(existingThreadGatePattern)].map((match) => ({
-        asset,
-        match,
-      })),
+    const openGuardMatchCount = nativeRendererAssets.reduce(
+      (count, asset) =>
+        count + findNativeExistingThreadVoiceOpenGuard(asset.source).matchCount,
+      0,
     );
-    if (existingThreadGateMatches.length !== 1) {
+    if (openGuardMatchCount > 1) {
       throw new Error(
-        "Expected one native existing-thread Voice gate, found " +
-          existingThreadGateMatches.length,
+        "Expected at most one treatment-gated existing-thread Voice path, found " +
+          openGuardMatchCount,
       );
     }
-    const existingThreadGateAsset = existingThreadGateMatches[0].asset;
-    const existingThreadGateMatch = existingThreadGateMatches[0].match;
-    const availabilityVariable = existingThreadGateMatch[1];
-    const newThreadStartVariable = existingThreadGateMatch[2];
-    const existingThreadEnabledVariable = existingThreadGateMatch[3];
-    const conversationIdVariable = existingThreadGateMatch[4];
-    const voiceFeatureEnabledVariable = existingThreadGateMatch[5];
-    const isVoiceThreadVariable = existingThreadGateMatch[6];
-    const existingThreadGatePrefix = existingThreadGateAsset.source.slice(
-      Math.max(0, existingThreadGateMatch.index - 1800),
-      existingThreadGateMatch.index,
-    );
-    const launchPendingMatches = [...existingThreadGatePrefix.matchAll(
-      /let ([A-Za-z_$][\w$]*)=[A-Za-z_$][\w$]*,[A-Za-z_$][\w$]*=[A-Za-z_$][\w$]*\.phase!==\x60inactive\x60/g,
-    )];
-    if (launchPendingMatches.length !== 1) {
-      throw new Error(
-        "Expected one native existing-thread pending state, found " +
-          launchPendingMatches.length,
+    const usesTreatmentGatedExistingThreadVoice = openGuardMatchCount === 1;
+    let existingThreadGateAsset = null;
+    let existingThreadGateLocation = null;
+    let existingThreadGateCondition = null;
+    let existingThreadStartLocation = null;
+    let existingThreadStartCondition = null;
+    let pendingLaunchGateAsset = null;
+    let pendingLaunchGateLocation = null;
+    let pendingLaunchGateCondition = null;
+    if (!usesTreatmentGatedExistingThreadVoice) {
+      const existingThreadGatePattern = /([A-Za-z_$][\w$]*)=\(([A-Za-z_$][\w$]*)!=null\|\|([A-Za-z_$][\w$]*)&&([A-Za-z_$][\w$]*)!=null\)&&([A-Za-z_$][\w$]*)&&navigator\.mediaDevices\?\.getUserMedia!=null&&typeof RTCPeerConnection<\x60u\x60[\s\S]{0,4200}?return[\s\S]{0,500}?\{isStartAvailable:\1,isSubmitStarting:[\s\S]{0,220}?isVoiceThread:([A-Za-z_$][\w$]*),/g;
+      const existingThreadGateMatches = nativeRendererAssets.flatMap((asset) =>
+        [...asset.source.matchAll(existingThreadGatePattern)].map((match) => ({
+          asset,
+          match,
+        })),
       );
-    }
-    const launchPendingVariable = launchPendingMatches[0][1];
-    const nativeExistingThreadGateBase = {
-      availabilityVariable,
-      conversationIdVariable,
-      existingThreadEnabledVariable,
-      isVoiceThreadVariable,
-      launchPendingVariable,
-      newThreadStartVariable,
-      voiceFeatureEnabledVariable,
-    };
-    const existingThreadHandoff = findNativeExistingThreadHandoff(
-      existingThreadGateAsset.source,
-      existingThreadGateMatch,
-      nativeExistingThreadGateBase,
-    );
-    if (existingThreadHandoff.matchCount !== 1) {
-      throw new Error(
-        "Expected one native existing-thread Voice handoff, found " +
-          existingThreadHandoff.matchCount,
+      if (existingThreadGateMatches.length !== 1) {
+        throw new Error(
+          "Expected one native existing-thread Voice gate, found " +
+            existingThreadGateMatches.length,
+        );
+      }
+      existingThreadGateAsset = existingThreadGateMatches[0].asset;
+      const existingThreadGateMatch = existingThreadGateMatches[0].match;
+      const availabilityVariable = existingThreadGateMatch[1];
+      const newThreadStartVariable = existingThreadGateMatch[2];
+      const existingThreadEnabledVariable = existingThreadGateMatch[3];
+      const conversationIdVariable = existingThreadGateMatch[4];
+      const voiceFeatureEnabledVariable = existingThreadGateMatch[5];
+      const isVoiceThreadVariable = existingThreadGateMatch[6];
+      const existingThreadGatePrefix = existingThreadGateAsset.source.slice(
+        Math.max(0, existingThreadGateMatch.index - 1800),
+        existingThreadGateMatch.index,
       );
-    }
-    const nativeExistingThreadGate = {
-      ...nativeExistingThreadGateBase,
-      ...existingThreadHandoff,
-    };
-    const existingThreadGateLocation = nativeSourceLocationAt(
-      existingThreadGateAsset.source,
-      existingThreadHandoff.breakpointOffset,
-    );
-    const existingThreadStartCallback = findNativeExistingThreadStartCallback(
-      existingThreadGateMatch[0],
-      nativeExistingThreadGate,
-    );
-    if (existingThreadStartCallback.matchCount !== 1) {
-      throw new Error(
-        "Expected one native existing-thread Voice start callback, found " +
-          existingThreadStartCallback.matchCount,
+      const launchPendingMatches = [...existingThreadGatePrefix.matchAll(
+        /let ([A-Za-z_$][\w$]*)=[A-Za-z_$][\w$]*,[A-Za-z_$][\w$]*=[A-Za-z_$][\w$]*\.phase!==\x60inactive\x60/g,
+      )];
+      if (launchPendingMatches.length !== 1) {
+        throw new Error(
+          "Expected one native existing-thread pending state, found " +
+            launchPendingMatches.length,
+        );
+      }
+      const nativeExistingThreadGateBase = {
+        availabilityVariable,
+        conversationIdVariable,
+        existingThreadEnabledVariable,
+        isVoiceThreadVariable,
+        launchPendingVariable: launchPendingMatches[0][1],
+        newThreadStartVariable,
+        voiceFeatureEnabledVariable,
+      };
+      const existingThreadHandoff = findNativeExistingThreadHandoff(
+        existingThreadGateAsset.source,
+        existingThreadGateMatch,
+        nativeExistingThreadGateBase,
       );
-    }
-    const existingThreadStartLocation = nativeSourceLocationAt(
-      existingThreadGateAsset.source,
-      existingThreadGateMatch.index +
-        existingThreadStartCallback.breakpointOffset,
-    );
-    const existingThreadGateCondition = nativeExistingThreadGateConditionFor(
-      nativeExistingThreadGate,
-      "existingThreadGateHits",
-    );
-    const existingThreadStartCondition =
-      nativeExistingThreadStartConditionFor(nativeExistingThreadGate);
-    const pendingLaunchGatePattern = /async function ([A-Za-z_$][\w$]*)\(([A-Za-z_$][\w$]*),([A-Za-z_$][\w$]*),[A-Za-z_$][\w$]*\)\{let ([A-Za-z_$][\w$]*)=\2\.get\([^)]+\);if\(\4!=null&&\4\.phase!==\x60failed\x60&&\3\.source!==\x60composer_button_new_thread\x60\)return;/g;
-    const pendingLaunchGateMatches = nativeRendererAssets.flatMap((asset) =>
-      [...asset.source.matchAll(pendingLaunchGatePattern)].map((match) => ({
-        asset,
-        match,
-      })),
-    );
-    if (pendingLaunchGateMatches.length !== 1) {
-      throw new Error(
-        "Expected one native pending Voice launch gate, found " +
-          pendingLaunchGateMatches.length,
+      if (existingThreadHandoff.matchCount !== 1) {
+        throw new Error(
+          "Expected one native existing-thread Voice handoff, found " +
+            existingThreadHandoff.matchCount,
+        );
+      }
+      const nativeExistingThreadGate = {
+        ...nativeExistingThreadGateBase,
+        ...existingThreadHandoff,
+      };
+      existingThreadGateLocation = nativeSourceLocationAt(
+        existingThreadGateAsset.source,
+        existingThreadHandoff.breakpointOffset,
       );
+      const existingThreadStartCallback = findNativeExistingThreadStartCallback(
+        existingThreadGateMatch[0],
+        nativeExistingThreadGate,
+      );
+      if (existingThreadStartCallback.matchCount !== 1) {
+        throw new Error(
+          "Expected one native existing-thread Voice start callback, found " +
+            existingThreadStartCallback.matchCount,
+        );
+      }
+      existingThreadStartLocation = nativeSourceLocationAt(
+        existingThreadGateAsset.source,
+        existingThreadGateMatch.index +
+          existingThreadStartCallback.breakpointOffset,
+      );
+      existingThreadGateCondition = nativeExistingThreadGateConditionFor(
+        nativeExistingThreadGate,
+        "existingThreadGateHits",
+      );
+      existingThreadStartCondition =
+        nativeExistingThreadStartConditionFor(nativeExistingThreadGate);
+      const pendingLaunchGatePattern = /async function ([A-Za-z_$][\w$]*)\(([A-Za-z_$][\w$]*),([A-Za-z_$][\w$]*),[A-Za-z_$][\w$]*\)\{let ([A-Za-z_$][\w$]*)=\2\.get\([^)]+\);if\(\4!=null&&\4\.phase!==\x60failed\x60&&\3\.source!==\x60composer_button_new_thread\x60\)return;/g;
+      const pendingLaunchGateMatches = nativeRendererAssets.flatMap((asset) =>
+        [...asset.source.matchAll(pendingLaunchGatePattern)].map((match) => ({
+          asset,
+          match,
+        })),
+      );
+      if (pendingLaunchGateMatches.length !== 1) {
+        throw new Error(
+          "Expected one native pending Voice launch gate, found " +
+            pendingLaunchGateMatches.length,
+        );
+      }
+      pendingLaunchGateAsset = pendingLaunchGateMatches[0].asset;
+      const pendingLaunchGateMatch = pendingLaunchGateMatches[0].match;
+      const pendingLaunchGateNeedle = "if(" + pendingLaunchGateMatch[4] + "!=null";
+      pendingLaunchGateLocation = nativeSourceLocationAt(
+        pendingLaunchGateAsset.source,
+        pendingLaunchGateMatch.index +
+          pendingLaunchGateMatch[0].lastIndexOf(pendingLaunchGateNeedle),
+      );
+      const pendingRequestVariable = pendingLaunchGateMatch[3];
+      const pendingStateVariable = pendingLaunchGateMatch[4];
+      pendingLaunchGateCondition =
+        "(" + pendingRequestVariable + ".source === 'composer_button_existing_thread' && (" +
+        pendingStateVariable + " = null, " +
+        "globalThis.__chatgptNativeVoiceCompatibilityState.pendingLaunchGateHits += 1), false)";
     }
-    const pendingLaunchGateAsset = pendingLaunchGateMatches[0].asset;
-    const pendingLaunchGateMatch = pendingLaunchGateMatches[0].match;
-    const pendingLaunchGateNeedle = "if(" + pendingLaunchGateMatch[4] + "!=null";
-    const pendingLaunchGateLocation = nativeSourceLocationAt(
-      pendingLaunchGateAsset.source,
-      pendingLaunchGateMatch.index +
-        pendingLaunchGateMatch[0].lastIndexOf(pendingLaunchGateNeedle),
-    );
-    const pendingRequestVariable = pendingLaunchGateMatch[3];
-    const pendingStateVariable = pendingLaunchGateMatch[4];
-    const pendingLaunchGateCondition =
-      "(" + pendingRequestVariable + ".source === 'composer_button_existing_thread' && (" +
-      pendingStateVariable + " = null, " +
-      "globalThis.__chatgptNativeVoiceCompatibilityState.pendingLaunchGateHits += 1), false)";
-    const coordinatorPattern = /async function ([A-Za-z_$][\w$]*)\(\{scope:[A-Za-z_$][\w$]*,activeCollaborationMode:[A-Za-z_$][\w$]*,activateRealtimeConversation:[A-Za-z_$][\w$]*,agentMode:[A-Za-z_$][\w$]*,currentLocalExecutionCwd:[A-Za-z_$][\w$]*,intent:[A-Za-z_$][\w$]*,memoryPreferences:[A-Za-z_$][\w$]*,onStartError:[A-Za-z_$][\w$]*,permissionProfileId:[A-Za-z_$][\w$]*,serviceTier:[A-Za-z_$][\w$]*,shouldSendPermissionOverrides:[A-Za-z_$][\w$]*,threadToolsEnabled:[A-Za-z_$][\w$]*,treatment:([A-Za-z_$][\w$]*),workspaceRootsForLocalExecution:[A-Za-z_$][\w$]*\}\)\{try\{/g;
-    const coordinatorMatches = nativeRendererAssets.flatMap((asset) =>
-      [...asset.source.matchAll(coordinatorPattern)].map((match) => ({
-        asset,
-        match,
-      })),
-    );
-    if (coordinatorMatches.length !== 1) {
+    let coordinatorMatchCount = 0;
+    const coordinatorMatches = nativeRendererAssets.flatMap((asset) => {
+      const coordinator = findNativeVoiceCoordinator(asset.source);
+      coordinatorMatchCount += coordinator.matchCount;
+      return coordinator.matchCount === 1 ? [{ asset, coordinator }] : [];
+    });
+    if (coordinatorMatchCount !== 1) {
       throw new Error(
-        "Expected one native Voice coordinator, found " + coordinatorMatches.length,
+        "Expected one native Voice coordinator, found " + coordinatorMatchCount,
       );
     }
     const coordinatorAsset = coordinatorMatches[0].asset;
-    const coordinatorMatch = coordinatorMatches[0].match;
+    const coordinator = coordinatorMatches[0].coordinator;
     const coordinatorLocation = nativeSourceLocationAt(
       coordinatorAsset.source,
-      coordinatorMatch.index + coordinatorMatch[0].lastIndexOf("try{"),
+      coordinator.breakpointOffset,
     );
-    const treatmentVariable = coordinatorMatch[2];
-    const coordinatorCondition =
-      "(" + treatmentVariable + " = { ..." + treatmentVariable +
-      ", existingThreadVoiceEnabled: true, dynamicTools: { ...(" + treatmentVariable +
-      ".dynamicTools ?? {}), ..." + JSON.stringify(voiceDynamicTools) + " } }, " +
-      "globalThis.__chatgptNativeVoiceCompatibilityState.coordinatorGateHits += 1, false)";
+    const coordinatorCondition = nativeVoiceCoordinatorConditionFor(
+      coordinator,
+      voiceDynamicTools,
+    );
     const results = [];
     for (const window of [mainWindow, overlayWindow]) {
       results.push(await window.webContents.executeJavaScript(rendererSource, true));
@@ -936,24 +1020,26 @@ const projectVoiceInstallerSource = String.raw`
         realtimeTranscriptLocation,
         realtimeTranscriptCondition,
       );
-      existingThreadVoiceLocation = await installSourceBreakpoint(
-        mainDebugger,
-        existingThreadGateAsset.url,
-        existingThreadGateLocation,
-        existingThreadGateCondition,
-      );
-      existingThreadVoiceStartLocation = await installSourceBreakpoint(
-        mainDebugger,
-        existingThreadGateAsset.url,
-        existingThreadStartLocation,
-        existingThreadStartCondition,
-      );
-      pendingLaunchLocation = await installSourceBreakpoint(
-        mainDebugger,
-        pendingLaunchGateAsset.url,
-        pendingLaunchGateLocation,
-        pendingLaunchGateCondition,
-      );
+      if (!usesTreatmentGatedExistingThreadVoice) {
+        existingThreadVoiceLocation = await installSourceBreakpoint(
+          mainDebugger,
+          existingThreadGateAsset.url,
+          existingThreadGateLocation,
+          existingThreadGateCondition,
+        );
+        existingThreadVoiceStartLocation = await installSourceBreakpoint(
+          mainDebugger,
+          existingThreadGateAsset.url,
+          existingThreadStartLocation,
+          existingThreadStartCondition,
+        );
+        pendingLaunchLocation = await installSourceBreakpoint(
+          mainDebugger,
+          pendingLaunchGateAsset.url,
+          pendingLaunchGateLocation,
+          pendingLaunchGateCondition,
+        );
+      }
       coordinatorLocations = await Promise.all([
         installSourceBreakpoint(
           mainDebugger,
@@ -1028,6 +1114,9 @@ const projectVoiceInstallerSource = String.raw`
           coordinatorLocations,
           existingThreadVoice: {
             enabled: true,
+            implementation: usesTreatmentGatedExistingThreadVoice
+              ? "treatment-flag"
+              : "legacy-gates",
             presentation: "native",
             uiLocation: existingThreadVoiceLocation,
             startLocation: existingThreadVoiceStartLocation,
@@ -1531,12 +1620,615 @@ const projectVoiceCleanupSource = String.raw`
 })()
 `;
 
+function rendererRoleForTarget(target) {
+  if (
+    target?.type !== "page" ||
+    !target.url?.startsWith("app://-/index.html")
+  ) {
+    return null;
+  }
+  return target.url.includes("initialRoute=%2Favatar-overlay")
+    ? "overlay"
+    : "main";
+}
+
+async function waitForRendererTargets() {
+  let lastTargets = [];
+  while (Date.now() < startupDeadline) {
+    try {
+      lastTargets = await (await fetch(inspectorEndpoint)).json();
+      const pages = lastTargets.filter(
+        (target) =>
+          target.type === "page" &&
+          target.url?.startsWith("app://-/index.html") &&
+          target.webSocketDebuggerUrl,
+      );
+      const main = pages.find((target) => rendererRoleForTarget(target) === "main");
+      if (main) return { main, pages };
+    } catch {}
+    await delay(100);
+  }
+  throw new Error(
+    `Timed out waiting for ChatGPT's main renderer debugger target on port ${inspectorPort}; last target count: ${lastTargets.length}`,
+  );
+}
+
+function rendererVoiceSourceAnalysisExpressionFor(appInitialUrl) {
+  return String.raw`
+(async () => {
+  const findNativeExistingThreadVoiceOpenGuard = ${findNativeExistingThreadVoiceOpenGuard.toString()};
+  const findNativeVoiceCoordinator = ${findNativeVoiceCoordinator.toString()};
+  const findNativeRealtimeTranscriptNotificationGate = ${findNativeRealtimeTranscriptNotificationGate.toString()};
+  const nativeVoiceCoordinatorConditionFor = ${nativeVoiceCoordinatorConditionFor.toString()};
+  const nativeRealtimeTranscriptConditionFor = ${nativeRealtimeTranscriptConditionFor.toString()};
+  const sourceLocationAt = ${sourceLocationAt.toString()};
+  const response = await fetch(${JSON.stringify(appInitialUrl)});
+  if (!response.ok) {
+    throw new Error("Could not read ChatGPT's app-initial renderer source");
+  }
+  const source = await response.text();
+  const openGuard = findNativeExistingThreadVoiceOpenGuard(source);
+  const coordinator = findNativeVoiceCoordinator(source);
+  const transcript = findNativeRealtimeTranscriptNotificationGate(source);
+  return {
+    hasNativeVoiceRouting:
+      source.includes("existingThreadVoiceEnabled") &&
+      source.includes("realtimeVoiceDynamicTools") &&
+      source.includes("workspaceRootsForLocalExecution"),
+    openGuardMatchCount: openGuard.matchCount,
+    coordinatorMatchCount: coordinator.matchCount,
+    transcriptMatchCount: transcript.matchCount,
+    coordinatorLocation:
+      coordinator.matchCount === 1
+        ? sourceLocationAt(source, coordinator.breakpointOffset)
+        : null,
+    transcriptLocation:
+      transcript.matchCount === 1
+        ? sourceLocationAt(source, transcript.breakpointOffset)
+        : null,
+    coordinatorCondition:
+      coordinator.matchCount === 1
+        ? nativeVoiceCoordinatorConditionFor(
+            coordinator,
+            ${JSON.stringify(voiceDynamicTools)},
+          )
+        : null,
+    transcriptCondition:
+      transcript.matchCount === 1
+        ? nativeRealtimeTranscriptConditionFor(transcript)
+        : null,
+  };
+})()
+`;
+}
+
+async function findLoadedAppInitialScriptUrl(connection) {
+  const deadline = Date.now() + 15000;
+  while (Date.now() < deadline) {
+    const parsed = await connection.waitForEvent(
+      "Debugger.scriptParsed",
+      Math.max(1, deadline - Date.now()),
+    );
+    if (!/^app:\/\/-\/assets\/app-initial-[A-Za-z0-9_-]+[.]js$/.test(parsed.url)) {
+      continue;
+    }
+    return parsed.url;
+  }
+  throw new Error("ChatGPT app-initial renderer script was not loaded");
+}
+
+function validateRendererVoiceAnalysis(analysis) {
+  if (!analysis?.hasNativeVoiceRouting) {
+    throw new Error("This ChatGPT build does not expose the native Voice routing path");
+  }
+  if (analysis.openGuardMatchCount !== 1) {
+    throw new Error(
+      "Expected one treatment-gated existing-thread Voice path, found " +
+        analysis.openGuardMatchCount,
+    );
+  }
+  if (analysis.coordinatorMatchCount !== 1) {
+    throw new Error(
+      "Expected one native Voice coordinator, found " +
+        analysis.coordinatorMatchCount,
+    );
+  }
+  if (analysis.transcriptMatchCount !== 1) {
+    throw new Error(
+      "Expected one native realtime transcript dispatcher, found " +
+        analysis.transcriptMatchCount,
+    );
+  }
+}
+
+function rendererBootstrapSource() {
+  return String.raw`
+    (() => {
+      if (location.protocol !== "app:") return;
+      globalThis.__chatgptNativeVoiceCompatibilityState ??= {
+        coordinatorGateHits: 0,
+        liveTranscriptNotifications: 0,
+      };
+      const install = () => {
+        try {
+          ${projectVoiceRendererTemplate}
+        } catch (error) {
+          console.error("Voice renderer enhancement failed", error);
+        }
+      };
+      if (document.readyState === "loading") {
+        addEventListener("DOMContentLoaded", install, { once: true });
+      } else {
+        install();
+      }
+    })()
+  `;
+}
+
+async function installRendererCdpVoiceEnhancements() {
+  if (voiceWorkerMode !== "inherit") {
+    throw new Error(
+      "Fixed-model mode is unavailable on this protected ChatGPT build; use the default composer-selected mode.",
+    );
+  }
+  if (!projectVoiceRoutingEnabled) {
+    throw new Error(
+      "CHATGPT_PROJECT_VOICE_ROUTING=0 is unavailable with the renderer debugger transport.",
+    );
+  }
+  const targets = await waitForRendererTargets();
+  const analysisConnection = await openInspectorConnection(
+    targets.main.webSocketDebuggerUrl,
+  );
+  let appInitialUrl;
+  let analysis;
+  try {
+    await analysisConnection.send("Runtime.enable", {});
+    await analysisConnection.send("Debugger.enable", {});
+    appInitialUrl = await findLoadedAppInitialScriptUrl(analysisConnection);
+    const analysisResult = await analysisConnection.send("Runtime.evaluate", {
+      expression: rendererVoiceSourceAnalysisExpressionFor(appInitialUrl),
+      awaitPromise: true,
+      returnByValue: true,
+    });
+    analysis = analysisResult?.result?.value;
+    validateRendererVoiceAnalysis(analysis);
+  } finally {
+    analysisConnection.close();
+  }
+
+  const coordinatorBreakpoint = {
+    condition: analysis.coordinatorCondition,
+    label: "existing-thread-treatment",
+    ...analysis.coordinatorLocation,
+    url: appInitialUrl,
+  };
+  const transcriptBreakpoint = {
+    condition: analysis.transcriptCondition,
+    label: "live-transcript",
+    ...analysis.transcriptLocation,
+    url: appInitialUrl,
+  };
+  const breakpointsForRole = (role) =>
+    role === "main"
+      ? [coordinatorBreakpoint]
+      : [coordinatorBreakpoint, transcriptBreakpoint];
+
+  const version = await (
+    await fetch(`http://127.0.0.1:${inspectorPort}/json/version`)
+  ).json();
+  if (!version.webSocketDebuggerUrl) {
+    throw new Error("ChatGPT did not expose its browser debugger target");
+  }
+  const connection = await openInspectorConnection(version.webSocketDebuggerUrl);
+  const sessions = new Map();
+  let lastMainRendererResult = null;
+  let lastError = null;
+  let stateListener = null;
+
+  const state = () => {
+    const installed = [...sessions.values()].filter(
+      (entry) => entry.role && entry.installed,
+    );
+    const main = installed.find((entry) => entry.role === "main");
+    const overlay = installed.find((entry) => entry.role === "overlay");
+    const rendererResult = main?.rendererResult ?? lastMainRendererResult;
+    return {
+      breakpoints: installed.reduce(
+        (count, entry) => count + entry.breakpoints.length,
+        0,
+      ),
+      expectedBreakpointsWithOverlay: 3,
+      existingThreadVoice: {
+        enabled: true,
+        implementation: "treatment-flag",
+        presentation: "native",
+      },
+      inactivityTimeoutMs: rendererResult?.inactivityTimeoutMs ?? 300000,
+      installed: Boolean(main),
+      lastError,
+      liveTranscript: {
+        enabled: true,
+        location: overlay?.breakpoints.find(
+          (breakpoint) => breakpoint.label === "live-transcript",
+        )?.location,
+        presentation: "live-thread-panel",
+      },
+      nativeCapabilities: true,
+      projectContext: rendererResult?.projectContext ?? null,
+      rendererTargets: {
+        main: installed.filter((entry) => entry.role === "main").length,
+        overlay: installed.filter((entry) => entry.role === "overlay").length,
+      },
+      status: main ? "ready" : "waiting-for-main-window",
+      transport: "renderer-cdp-daemon",
+      version: projectVoicePatchVersion,
+      voiceCaptureConstraints: rendererResult?.voiceCaptureConstraints ?? null,
+      voiceDynamicTools,
+      voiceModelPicker: { enabled: true, location: null },
+    };
+  };
+
+  const notifyState = () => stateListener?.(state());
+  const configure = async ({ sessionId, targetInfo, waitingForDebugger }) => {
+    const existing = sessions.get(targetInfo.targetId);
+    if (existing) {
+      if (existing.sessionId !== sessionId && waitingForDebugger) {
+        await connection.send(
+          "Runtime.runIfWaitingForDebugger",
+          {},
+          sessionId,
+        ).catch(() => {});
+      }
+      return existing.promise;
+    }
+    const role = rendererRoleForTarget(targetInfo);
+    const entry = {
+      breakpoints: [],
+      installed: false,
+      promise: null,
+      rendererResult: null,
+      role,
+      sessionId,
+      targetId: targetInfo.targetId,
+      url: targetInfo.url,
+    };
+    sessions.set(targetInfo.targetId, entry);
+    entry.promise = (async () => {
+      await connection.send("Runtime.enable", {}, sessionId);
+      await connection.send("Debugger.enable", {}, sessionId);
+      await connection.send("Page.enable", {}, sessionId);
+      await connection.send(
+        "Page.addScriptToEvaluateOnNewDocument",
+        { source: rendererBootstrapSource() },
+        sessionId,
+      );
+      await connection.send(
+        "Runtime.evaluate",
+        {
+          expression:
+            "globalThis.__chatgptNativeVoiceCompatibilityState ??= {" +
+            "coordinatorGateHits:0,liveTranscriptNotifications:0}; true",
+          returnByValue: true,
+        },
+        sessionId,
+      );
+      const roleBreakpoints = breakpointsForRole(role);
+      for (const breakpoint of roleBreakpoints) {
+        const { label, ...params } = breakpoint;
+        const result = await connection.send(
+          "Debugger.setBreakpointByUrl",
+          params,
+          sessionId,
+        );
+        if (
+          !waitingForDebugger &&
+          role &&
+          (!Array.isArray(result.locations) || result.locations.length === 0)
+        ) {
+          throw new Error(`Voice breakpoint did not resolve in ${role}: ${label}`);
+        }
+        entry.breakpoints.push({
+          breakpointId: result.breakpointId,
+          label,
+          location: result.locations?.[0] ?? {
+            columnNumber: params.columnNumber,
+            lineNumber: params.lineNumber,
+          },
+        });
+      }
+      if (waitingForDebugger) {
+        await connection.send("Runtime.runIfWaitingForDebugger", {}, sessionId);
+      }
+      if (role) {
+        let renderer = null;
+        const rendererDeadline = Date.now() + 15000;
+        while (Date.now() < rendererDeadline) {
+          try {
+            renderer = await connection.send(
+              "Runtime.evaluate",
+              {
+                expression: projectVoiceRendererTemplate,
+                returnByValue: true,
+              },
+              sessionId,
+            );
+            if (renderer?.result?.value?.installed === true) break;
+          } catch {}
+          await delay(50);
+        }
+        if (renderer?.result?.value?.installed !== true) {
+          throw new Error(
+            `Voice renderer tuning did not install in ${role}: ${JSON.stringify(renderer?.result?.value)}`,
+          );
+        }
+        entry.rendererResult = renderer.result.value;
+        if (role === "main") lastMainRendererResult = renderer.result.value;
+      }
+      entry.installed = true;
+      lastError = null;
+      notifyState();
+      return entry;
+    })().catch(async (error) => {
+      sessions.delete(targetInfo.targetId);
+      lastError = error.message;
+      if (waitingForDebugger) {
+        await connection.send(
+          "Runtime.runIfWaitingForDebugger",
+          {},
+          sessionId,
+        ).catch(() => {});
+      }
+      notifyState();
+      throw error;
+    });
+    return entry.promise;
+  };
+
+  const unsubscribe = connection.onEvent((message) => {
+    if (message.method === "Target.attachedToTarget") {
+      void configure(message.params).catch((error) => {
+        console.error(
+          `${new Date().toISOString()} could not configure renderer target: ${error.message}`,
+        );
+      });
+      return;
+    }
+    if (message.method === "Target.targetInfoChanged") {
+      const entry = sessions.get(message.params.targetInfo.targetId);
+      if (!entry) return;
+      entry.url = message.params.targetInfo.url;
+      entry.role ??= rendererRoleForTarget(message.params.targetInfo);
+      notifyState();
+      return;
+    }
+    if (message.method === "Target.detachedFromTarget") {
+      for (const [targetId, entry] of sessions) {
+        if (entry.sessionId !== message.params.sessionId) continue;
+        sessions.delete(targetId);
+        notifyState();
+        break;
+      }
+    }
+  });
+
+  try {
+    await connection.send("Target.setDiscoverTargets", { discover: true });
+    await connection.send("Target.setAutoAttach", {
+      autoAttach: true,
+      filter: [{ type: "page", exclude: false }, { exclude: true }],
+      flatten: true,
+      waitForDebuggerOnStart: true,
+    });
+    await delay(250);
+    const currentTargets = await (await fetch(inspectorEndpoint)).json();
+    for (const target of currentTargets.filter(
+      (candidate) => candidate.type === "page",
+    )) {
+      if (sessions.has(target.id)) continue;
+      const attached = await connection.send("Target.attachToTarget", {
+        flatten: true,
+        targetId: target.id,
+      });
+      await configure({
+        sessionId: attached.sessionId,
+        targetInfo: {
+          targetId: target.id,
+          type: target.type,
+          url: target.url,
+        },
+        waitingForDebugger: false,
+      });
+    }
+    const mainEntry = [...sessions.values()].find(
+      (entry) => entry.role === "main",
+    );
+    if (!mainEntry) throw new Error("ChatGPT's main renderer was not attached");
+    await mainEntry.promise;
+    return {
+      connection,
+      dispose: () => {
+        unsubscribe();
+        connection.close();
+      },
+      onStateChange(listener) {
+        stateListener = listener;
+      },
+      state,
+    };
+  } catch (error) {
+    unsubscribe();
+    connection.close();
+    throw error;
+  }
+}
+
+function rendererDaemonConfigKey() {
+  return JSON.stringify({
+    projectVoicePatchVersion,
+    voiceDynamicTools,
+    voiceWorkerMode,
+  });
+}
+
+function readRendererDaemonState() {
+  try {
+    return JSON.parse(readFileSync(rendererDaemonStatePath, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+function removeRendererDaemonStateIfOwned() {
+  const state = readRendererDaemonState();
+  if (state?.daemonPid !== process.pid) return;
+  try {
+    unlinkSync(rendererDaemonStatePath);
+  } catch {}
+}
+
+function isManagedRendererDaemon(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    const command = execFileSync("/bin/ps", [
+      "-p",
+      String(pid),
+      "-o",
+      "command=",
+    ], { encoding: "utf8" });
+    return (
+      command.includes(fileURLToPath(import.meta.url)) &&
+      command.includes("--renderer-daemon")
+    );
+  } catch {
+    return false;
+  }
+}
+
+async function stopPreviousRendererDaemon() {
+  const previous = readRendererDaemonState();
+  if (!isManagedRendererDaemon(previous?.daemonPid)) {
+    try {
+      unlinkSync(rendererDaemonStatePath);
+    } catch {}
+    return;
+  }
+  process.kill(previous.daemonPid, "SIGTERM");
+  const deadline = Date.now() + 5000;
+  while (Date.now() < deadline && isManagedRendererDaemon(previous.daemonPid)) {
+    await delay(50);
+  }
+  if (isManagedRendererDaemon(previous.daemonPid)) {
+    throw new Error(
+      `Previous Voice renderer helper ${previous.daemonPid} did not stop; it was not force-terminated.`,
+    );
+  }
+}
+
+async function startRendererDaemon() {
+  const existing = readRendererDaemonState();
+  if (
+    existing?.configKey === rendererDaemonConfigKey() &&
+    isManagedRendererDaemon(existing.daemonPid)
+  ) {
+    return { ...existing.state, reused: true };
+  }
+  await stopPreviousRendererDaemon();
+  mkdirSync(rendererDaemonDirectory, { recursive: true, mode: 0o700 });
+  const logDirectory = join(
+    homedir(),
+    "Library",
+    "Logs",
+    "chatgpt-voice-enhancements",
+  );
+  mkdirSync(logDirectory, { recursive: true, mode: 0o700 });
+  const logFile = openSync(rendererDaemonLogPath, "a", 0o600);
+  const child = spawn(
+    process.execPath,
+    [
+      fileURLToPath(import.meta.url),
+      String(inspectorPort),
+      String(Math.max(30000, startupDeadline - Date.now())),
+      "--renderer-daemon",
+    ],
+    {
+      detached: true,
+      env: process.env,
+      stdio: ["ignore", logFile, logFile, "ipc"],
+    },
+  );
+  closeSync(logFile);
+  const state = await new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      reject(new Error("Timed out waiting for the Voice renderer helper"));
+    }, Math.max(30000, startupDeadline - Date.now()));
+    const finish = (callback) => (...values) => {
+      clearTimeout(timeout);
+      callback(...values);
+    };
+    child.once("message", finish((message) => {
+      if (message?.ready === true) resolve(message.state);
+      else reject(new Error(message?.error ?? "Voice renderer helper failed"));
+    }));
+    child.once("error", finish(reject));
+    child.once("exit", finish((code, signal) => {
+      reject(
+        new Error(
+          `Voice renderer helper exited before ready (code=${code}, signal=${signal})`,
+        ),
+      );
+    }));
+  }).catch((error) => {
+    child.kill("SIGTERM");
+    throw new Error(`${error.message}; see ${rendererDaemonLogPath}`);
+  });
+  child.disconnect();
+  child.unref();
+  return state;
+}
+
+async function runRendererDaemon() {
+  const supervisor = await installRendererCdpVoiceEnhancements();
+  activeRendererConnections = [supervisor.connection];
+  mkdirSync(rendererDaemonDirectory, { recursive: true, mode: 0o700 });
+  const writeState = (state) => {
+    writeFileSync(
+      rendererDaemonStatePath,
+      JSON.stringify(
+        {
+          configKey: rendererDaemonConfigKey(),
+          daemonPid: process.pid,
+          logPath: rendererDaemonLogPath,
+          state,
+        },
+        null,
+        2,
+      ) + "\n",
+      { mode: 0o600 },
+    );
+  };
+  supervisor.onStateChange(writeState);
+  const state = supervisor.state();
+  writeState(state);
+  process.send?.({ ready: true, state });
+  console.log(
+    `${new Date().toISOString()} installed ${state.breakpoints} Voice renderer breakpoints`,
+  );
+  await supervisor.connection.closed;
+  supervisor.dispose();
+  activeRendererConnections = [];
+  removeRendererDaemonStateIfOwned();
+}
+
 async function main() {
   if (selfTest) {
+    new Function(projectVoiceInstallerSource);
     runOverrideSelfTest();
     runVoiceWindowReadinessSelfTest();
     runVoiceThreadFooterGateSelfTest();
     runNativeRealtimeTranscriptSelfTest();
+    runNativeVoiceCoordinatorSelfTest();
+    await runRendererVoiceSourceAnalysisSelfTest();
     runNativeExistingThreadStartSelfTest();
     await runExistingThreadVoiceGateSelfTest();
     await runProjectVoiceRendererSelfTest();
@@ -1556,7 +2248,39 @@ async function main() {
     return;
   }
 
-  const target = await waitForInspectorTarget();
+  const targets = await waitForInspectorTargets();
+  if (targets.some((target) => target.type === "page")) {
+    if (rendererDaemon) {
+      await runRendererDaemon();
+      return;
+    }
+    const projectVoiceState = await startRendererDaemon();
+    console.log(
+      "Installed per-chat Voice worker selection through ChatGPT's native composer settings.",
+    );
+    console.log(
+      projectVoiceState.reused
+        ? `Reused the active Voice renderer helper with ${projectVoiceState.breakpoints} breakpoints.`
+        : `Installed ${projectVoiceState.breakpoints} renderer breakpoints in one app-lifetime helper process.`,
+    );
+    console.log(
+      `Installed fixed Voice inactivity timeout: ${projectVoiceState.inactivityTimeoutMs / 60000} minutes.`,
+    );
+    console.log(
+      `Installed Voice microphone processing: ${Object.keys(projectVoiceState.voiceCaptureConstraints ?? {}).join(", ")}.`,
+    );
+    console.log(
+      "Installed Voice dynamic tools: Appshots, speak_to_user, end_realtime_voice_call.",
+    );
+    console.log("Installed native Voice launch for ordinary existing tasks.");
+    console.log("Installed the live Voice transcript in the conversation thread.");
+    console.log(
+      "The renderer helper and loopback debugger remain active only until ChatGPT exits.",
+    );
+    return;
+  }
+  const target = targets.find((candidate) => candidate.webSocketDebuggerUrl);
+  if (!target) throw new Error("ChatGPT debugger endpoint did not expose a target");
   const connection = await openInspectorConnection(target.webSocketDebuggerUrl);
   activeConnection = connection;
 
@@ -1844,6 +2568,98 @@ function runNativeRealtimeTranscriptSelfTest() {
   );
   console.log(
     "Native realtime transcript self-test passed: accepted Voice notifications are forwarded to the display-only transcript hook.",
+  );
+}
+
+function runNativeVoiceCoordinatorSelfTest() {
+  const currentSource =
+    "async function KHs({scope:e,activeCollaborationMode:t,activateRealtimeConversation:n,agentMode:r,currentLocalExecutionCwd:i,intent:a,memoryPreferences:o,onStartError:s,permissionProfileId:c,projectId:l,serviceTier:u,shouldSendPermissionOverrides:d,threadToolsEnabled:f,treatment:p,workspaceRootsForLocalExecution:m}){try{return p}}";
+  const coordinator = findNativeVoiceCoordinator(currentSource);
+  assert.equal(coordinator.matchCount, 1);
+  assert.equal(coordinator.functionName, "KHs");
+  assert.equal(coordinator.treatmentVariable, "p");
+  assert.equal(
+    currentSource.startsWith("try{", coordinator.breakpointOffset),
+    true,
+  );
+  const previousSource = currentSource.replace("projectId:l,", "");
+  assert.equal(findNativeVoiceCoordinator(previousSource).matchCount, 1);
+  assert.equal(findNativeVoiceCoordinator("const unrelated = true").matchCount, 0);
+
+  const openGuardSource =
+    "resumeConversation({workspaceRoots:this.options.existingThreadVoiceEnabled?this.options.workspaceRootsForLocalExecution:[`/`]});let{threadSource:i}=r;if(!this.options.existingThreadVoiceEnabled&&i!==`realtime_voice`)throw Error(`This thread is not a voice chat`)";
+  assert.equal(
+    findNativeExistingThreadVoiceOpenGuard(openGuardSource).matchCount,
+    1,
+  );
+  assert.equal(
+    findNativeExistingThreadVoiceOpenGuard("const unrelated = true").matchCount,
+    0,
+  );
+
+  const context = {
+    p: {
+      dynamicTools: { preserved: true },
+      existingThreadVoiceEnabled: false,
+      newThread: { preserved: true },
+    },
+    globalThis: {
+      __chatgptNativeVoiceCompatibilityState: { coordinatorGateHits: 0 },
+    },
+  };
+  runInNewContext(
+    nativeVoiceCoordinatorConditionFor(coordinator, {
+      appshotsEnabled: true,
+      endRealtimeVoiceCallEnabled: true,
+      speakToUserEnabled: true,
+    }),
+    context,
+  );
+  assert.equal(context.p.existingThreadVoiceEnabled, true);
+  assert.equal(context.p.newThread.preserved, true);
+  assert.equal(context.p.dynamicTools.preserved, true);
+  assert.equal(context.p.dynamicTools.appshotsEnabled, true);
+  assert.equal(context.p.dynamicTools.endRealtimeVoiceCallEnabled, true);
+  assert.equal(context.p.dynamicTools.speakToUserEnabled, true);
+  assert.equal(
+    context.globalThis.__chatgptNativeVoiceCompatibilityState
+      .coordinatorGateHits,
+    1,
+  );
+  console.log(
+    "Native Voice coordinator self-test passed: current and previous signatures are identified uniquely, and the current existing-thread treatment flag is enabled without replacing unrelated settings.",
+  );
+}
+
+async function runRendererVoiceSourceAnalysisSelfTest() {
+  const currentSource = [
+    "const nativeCapabilities={realtimeVoiceDynamicTools:true,workspaceRootsForLocalExecution:true};",
+    "const guard={workspaceRoots:this.options.existingThreadVoiceEnabled?this.options.workspaceRootsForLocalExecution:[`/`]};if(!this.options.existingThreadVoiceEnabled&&kind!==`realtime_voice`)throw Error(`This thread is not a voice chat`);",
+    "async function KHs({scope:a,activeCollaborationMode:b,activateRealtimeConversation:c,agentMode:d,currentLocalExecutionCwd:e,intent:f,memoryPreferences:g,onStartError:h,permissionProfileId:i,projectId:j,serviceTier:k,shouldSendPermissionOverrides:l,threadToolsEnabled:m,treatment:p,workspaceRootsForLocalExecution:q}){try{return p}catch(error){throw error}}",
+    "class RealtimeStore{handleRealtimeNotification(store,event){if(!(this.conversationId==null||event.params.threadId!==this.conversationId))switch(event.method){case `thread/realtime/transcript/delta`:return store}}}",
+  ].join("\n");
+  const context = {
+    fetch: async () => ({
+      ok: true,
+      text: async () => currentSource,
+    }),
+  };
+  context.globalThis = context;
+  const expression = rendererVoiceSourceAnalysisExpressionFor(
+    "app://-/assets/app-initial-test.js",
+  );
+  new Function(expression);
+  const result = await runInNewContext(expression, context);
+  assert.equal(result.hasNativeVoiceRouting, true);
+  assert.equal(result.openGuardMatchCount, 1);
+  assert.equal(result.coordinatorMatchCount, 1);
+  assert.equal(result.transcriptMatchCount, 1);
+  assert.ok(result.coordinatorLocation);
+  assert.ok(result.transcriptLocation);
+  assert.match(result.coordinatorCondition, /existingThreadVoiceEnabled/);
+  assert.match(result.transcriptCondition, /liveTranscriptNotifications/);
+  console.log(
+    "Renderer source-analysis self-test passed: current Voice routing, coordinator, and transcript locations are discovered locally without transferring the app bundle.",
   );
 }
 
@@ -2714,20 +3530,19 @@ function runOverrideSelfTest() {
   );
 }
 
-async function waitForInspectorTarget() {
+async function waitForInspectorTargets() {
   let lastError = null;
   while (Date.now() < startupDeadline) {
     try {
       const targets = await (await fetch(inspectorEndpoint)).json();
-      const target = targets.find((candidate) => candidate.webSocketDebuggerUrl);
-      if (target) return target;
+      if (targets.some((candidate) => candidate.webSocketDebuggerUrl)) return targets;
     } catch (error) {
       lastError = error;
     }
     await delay(100);
   }
   throw new Error(
-    `Timed out waiting for the ChatGPT main-process inspector on port ${inspectorPort}: ${lastError?.message ?? "no inspector target"}`,
+    `Timed out waiting for a ChatGPT debugger endpoint on port ${inspectorPort}: ${lastError?.message ?? "no debugger target"}`,
   );
 }
 
@@ -2765,11 +3580,16 @@ function openInspectorConnection(webSocketUrl) {
     const pending = new Map();
     const eventWaiters = new Map();
     const eventBacklog = new Map();
+    const eventListeners = new Set();
     let nextId = 1;
     let opened = false;
+    let resolveClosed;
+    const closed = new Promise((resolveClosedPromise) => {
+      resolveClosed = resolveClosedPromise;
+    });
     const openTimeout = setTimeout(() => {
       socket.close();
-      reject(new Error("Timed out opening the main-process inspector WebSocket"));
+      reject(new Error("Timed out opening the ChatGPT debugger WebSocket"));
     }, 15000);
 
     function rejectOutstanding(error) {
@@ -2791,7 +3611,8 @@ function openInspectorConnection(webSocketUrl) {
       opened = true;
       clearTimeout(openTimeout);
       resolve({
-        send(method, params) {
+        closed,
+        send(method, params, sessionId) {
           if (socket.readyState !== WebSocket.OPEN) {
             return Promise.reject(new Error(`Inspector WebSocket closed before ${method}`));
           }
@@ -2807,8 +3628,19 @@ function openInspectorConnection(webSocketUrl) {
               reject: rejectCommand,
               timeout,
             });
-            socket.send(JSON.stringify({ id, method, params }));
+            socket.send(
+              JSON.stringify({
+                id,
+                method,
+                params,
+                ...(sessionId ? { sessionId } : {}),
+              }),
+            );
           });
+        },
+        onEvent(listener) {
+          eventListeners.add(listener);
+          return () => eventListeners.delete(listener);
         },
         waitForEvent(method, timeoutMs) {
           const backlogged = eventBacklog.get(method);
@@ -2856,6 +3688,7 @@ function openInspectorConnection(webSocketUrl) {
       }
 
       if (!message.method) return;
+      for (const listener of eventListeners) listener(message);
       const waiters = eventWaiters.get(message.method) ?? [];
       const waiter = waiters.shift();
       if (waiter) {
@@ -2871,15 +3704,17 @@ function openInspectorConnection(webSocketUrl) {
 
     socket.addEventListener("error", () => {
       clearTimeout(openTimeout);
-      const error = new Error("Main-process inspector WebSocket error");
+      const error = new Error("ChatGPT debugger WebSocket error");
       if (!opened) reject(error);
       rejectOutstanding(error);
+      resolveClosed(error);
     });
     socket.addEventListener("close", () => {
       clearTimeout(openTimeout);
-      const error = new Error("Main-process inspector WebSocket closed");
+      const error = new Error("ChatGPT debugger WebSocket closed");
       if (!opened) reject(error);
       rejectOutstanding(error);
+      resolveClosed(error);
     });
   });
 }
@@ -2987,6 +3822,9 @@ async function resumeBeforeExit(exitCode) {
       .catch(() => {});
     activeConnection.close();
   }
+  for (const connection of activeRendererConnections) connection.close();
+  activeRendererConnections = [];
+  removeRendererDaemonStateIfOwned();
   process.exit(exitCode);
 }
 
@@ -2999,5 +3837,7 @@ process.once("SIGTERM", () => {
 
 main().catch((error) => {
   console.error(error.message);
+  if (rendererDaemon) process.send?.({ error: error.message, ready: false });
+  removeRendererDaemonStateIfOwned();
   process.exit(1);
 });

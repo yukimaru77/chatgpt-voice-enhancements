@@ -2,13 +2,14 @@
 
 /**
  * Inspector utility for ChatGPT Desktop Voice enhancement development.
- * With no flags it reports main-process and renderer state as JSON.
- * --assert-existing-thread-voice verifies the installed v10 capability.
- * --install-capture, --dispose-project-routing, and --inject-css mutate the
- * current in-memory runtime and are intended only for debugging.
+ * With no flags it reports the current renderer supervisor or legacy
+ * main-process state as JSON. --assert-existing-thread-voice verifies the
+ * installed capability. Mutation flags are legacy development tools.
  */
 
 import { readFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 
 const inspectorPort = Number.parseInt(process.argv[2] ?? "9333", 10);
 const assertExistingThreadVoice = process.argv.includes(
@@ -51,6 +52,161 @@ const safeInjectedScript = JSON.stringify(injectedScript)
   .replaceAll("`", "\\`")
   .replaceAll("${", "\\${");
 const inspectorEndpoint = `http://127.0.0.1:${inspectorPort}/json/list`;
+
+async function evaluateRendererTarget(target, expression) {
+  const socket = new WebSocket(target.webSocketDebuggerUrl);
+  await new Promise((resolve, reject) => {
+    socket.addEventListener("open", resolve, { once: true });
+    socket.addEventListener(
+      "error",
+      () => reject(new Error(`Inspector connection failed for ${target.url}`)),
+      { once: true },
+    );
+  });
+  try {
+    const id = 1;
+    const result = await new Promise((resolve, reject) => {
+      socket.addEventListener("message", (event) => {
+        const message = JSON.parse(event.data);
+        if (message.id !== id) return;
+        if (message.error || message.result?.exceptionDetails) {
+          reject(
+            new Error(
+              message.error?.message ??
+                message.result.exceptionDetails.exception?.description ??
+                message.result.exceptionDetails.text,
+            ),
+          );
+          return;
+        }
+        resolve(message.result?.result?.value ?? null);
+      });
+      socket.send(
+        JSON.stringify({
+          id,
+          method: "Runtime.evaluate",
+          params: { expression, returnByValue: true },
+        }),
+      );
+    });
+    return result;
+  } finally {
+    socket.close();
+  }
+}
+
+const inspectorTargets = await (await fetch(inspectorEndpoint)).json();
+const rendererTargets = inspectorTargets.filter(
+  (candidate) =>
+    candidate.type === "page" &&
+    candidate.url?.startsWith("app://-/index.html") &&
+    candidate.webSocketDebuggerUrl,
+);
+
+if (rendererTargets.length > 0) {
+  const unsupportedCurrentBuildFlag = [
+    sourceSearchTerm && "--search-app-source",
+    mainSourceSearchTerm && "--search-main-source",
+    detachRendererDebuggers && "--detach-renderer-debuggers",
+    inspectInstallProgress && "--install-progress",
+    inspectBreakpointState && "--breakpoint-state",
+    findFunctionName && "--find-renderer-function",
+    installCapture && "--install-capture",
+    disposeProjectRouting && "--dispose-project-routing",
+    injectedScript && "--inject-css",
+  ].find(Boolean);
+  if (unsupportedCurrentBuildFlag) {
+    throw new Error(
+      `${unsupportedCurrentBuildFlag} is available only with the legacy main-process inspector`,
+    );
+  }
+
+  const rendererExpression = String.raw`
+    (() => {
+      const contextState = globalThis.__chatgptNativeProjectVoiceContextState ?? null;
+      return {
+        href: location.href,
+        nativeProjectVoiceContextState: contextState
+          ? {
+              installed: contextState.installed,
+              version: contextState.version,
+              projectContext:
+                globalThis.__chatgptNativeProjectVoiceContext?.() ?? null,
+              liveTranscript: contextState.liveTranscriptSnapshot?.() ?? null,
+            }
+          : null,
+        nativeVoiceCompatibilityState:
+          globalThis.__chatgptNativeVoiceCompatibilityState ?? null,
+        voiceControls: [...document.querySelectorAll("button, [role=button]")]
+          .map((element) => ({
+            ariaLabel: element.getAttribute("aria-label"),
+            disabled: "disabled" in element ? element.disabled : null,
+            text: (element.textContent ?? "").replace(/\s+/g, " ").trim(),
+            title: element.getAttribute("title"),
+          }))
+          .filter((control) =>
+            [control.ariaLabel, control.text, control.title]
+              .filter(Boolean)
+              .some((value) => /voice|audio|sound|microphone|音声|マイク/i.test(value)),
+          ),
+      };
+    })()
+  `;
+  const windows = await Promise.all(
+    rendererTargets.map(async (target) => ({
+      title: target.title,
+      url: target.url,
+      renderer: await evaluateRendererTarget(target, rendererExpression),
+    })),
+  );
+  const daemonStatePath = join(
+    homedir(),
+    "Library",
+    "Application Support",
+    "chatgpt-voice-enhancements",
+    `renderer-${inspectorPort}.json`,
+  );
+  let daemon = null;
+  try {
+    daemon = JSON.parse(readFileSync(daemonStatePath, "utf8"));
+  } catch {}
+  let daemonAlive = false;
+  try {
+    if (Number.isInteger(daemon?.daemonPid) && daemon.daemonPid > 0) {
+      process.kill(daemon.daemonPid, 0);
+      daemonAlive = true;
+    }
+  } catch {}
+  const runtimeState = {
+    transport: "renderer-cdp-daemon",
+    daemon: daemon
+      ? {
+          alive: daemonAlive,
+          pid: daemon.daemonPid,
+          logPath: daemon.logPath,
+          state: daemon.state,
+        }
+      : null,
+    windows,
+  };
+  if (assertExistingThreadVoice) {
+    const installedRenderers = windows.filter(
+      (window) =>
+        window.renderer?.nativeProjectVoiceContextState?.installed === true,
+    );
+    if (
+      !daemonAlive ||
+      daemon?.state?.installed !== true ||
+      daemon.state.existingThreadVoice?.enabled !== true ||
+      installedRenderers.length !== rendererTargets.length
+    ) {
+      throw new Error("Existing-thread Voice launch is not installed");
+    }
+    console.log("Existing-thread Voice launch is installed.");
+  } else {
+    console.log(JSON.stringify(runtimeState, null, 2));
+  }
+} else {
 
 function inspectProjectContextInRenderer() {
   const fiberFor = (element) => {
@@ -793,3 +949,4 @@ if (inspectInstallProgress) {
   console.log(JSON.stringify(runtimeState, null, 2));
 }
 socket.close();
+}
