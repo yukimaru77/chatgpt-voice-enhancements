@@ -22,7 +22,7 @@ This is not a Sol/high model injector. The default mode follows the model and re
 - Bundled Codex: `0.146.0-alpha.9.2`
 - Worker request hook: `chatgpt-voice-worker-request-v6`
 - Project Voice context: `chatgpt-native-project-voice-context-v9`
-- Native project/model breakpoints: `chatgpt-native-project-voice-breakpoints-v25`
+- Native project/model breakpoints: `chatgpt-native-project-voice-breakpoints-v27`
 - Runtime result: all five native-path breakpoints resolved in build `7579` on 2026-09-04. An existing text task completed a real Voice launch with live microphone and receive tracks, a connected WebRTC peer, and increasing inbound and outbound RTP packet counters.
 
 An app update can change the minified exports or launch schema. Revalidate before assuming compatibility with a newer build.
@@ -63,7 +63,7 @@ After installation:
 7. An otherwise idle Voice task remains open for five minutes. Transcript and worker activity reset that timer.
 8. New Voice microphone streams request `voiceIsolation`, `echoCancellation`, `noiseSuppression`, and `autoGainControl`; dictation streams are left unchanged.
 
-For a task that originally began with text, open the task and leave the composer empty while no response is running. The Voice button now appears. Starting Voice uses ChatGPT's native `composer_button_existing_thread` path and calls `thread/realtime/start` with that task's existing thread ID.
+For a task that originally began with text, open the task and leave the composer empty while no response is running. The Voice button now appears. Starting Voice uses ChatGPT's native `composer_button_existing_thread` path and calls `thread/realtime/start` with that task's existing thread ID. Once the global Voice session accepts the handoff, the composer control changes from its loading ring to an enabled Stop button.
 
 Run the installer again only after ChatGPT fully quits, restarts, crashes, or updates. The hooks are in memory and disappear with the ChatGPT process.
 
@@ -170,7 +170,7 @@ ChatGPT already ships an existing-thread handler that calls:
 thread/realtime/start { threadId: conversationId, ... }
 ```
 
-The app normally makes that handler available only when the thread is already classified as a Voice thread. The existing-task source breakpoints change the realtime-controls result so `isStartAvailable` and `isVoiceThread` enable the native button and handler. When ChatGPT marks an idle task as interrupted, Voice takes precedence over its Resume button because the Voice path already performs `maybe-resume-conversation`. New-chat behavior, text submission, and running turns are unchanged.
+The app normally makes that handler available only when the thread is already classified as a Voice thread. The existing-task source breakpoints change the realtime-controls result so `isStartAvailable` and `isVoiceThread` enable the native button and handler. They also clear the main window's launch-pending state after the matching global Voice session takes ownership; this exposes the native Stop control instead of leaving a disabled loading ring. When ChatGPT marks an idle task as interrupted, Voice takes precedence over its Resume button because the Voice path already performs `maybe-resume-conversation`. New-chat behavior, text submission, and running turns are unchanged.
 
 ## Why earlier versions failed
 
@@ -205,7 +205,7 @@ The checks prove:
 - fresh Voice starts receive the three requested `realtimeVoiceDynamicTools` fields without changing ordinary task starts.
 - the current minified compact-composer gate is uniquely identified before the native Voice picker breakpoint is installed.
 - the Voice-thread footer gate is uniquely identified and disabled only when `realtimeSession.isVoiceThread` is true.
-- the existing-thread Voice gate is uniquely identified, enabled only when a conversation ID exists, and leaves new-chat behavior unchanged.
+- the existing-thread Voice gate is uniquely identified, enabled only when a conversation ID exists, and clears launch-pending only after the matching global session is available, while leaving new-chat behavior unchanged.
 - an existing-thread start callback cached before installation is enabled when invoked, while a new-thread start remains unchanged.
 
 Self-tests are necessary but not sufficient after an app update. Final verification is one fresh Voice launch followed by checking that the task stayed in the selected project and that the provider received the selected model and reasoning effort.

@@ -63,7 +63,7 @@ const projectVoiceRendererTemplate = readFileSync(
   new URL("./chatgpt-voice-renderer-enhancements.js", import.meta.url),
   "utf8",
 );
-const projectVoicePatchVersion = "chatgpt-native-project-voice-breakpoints-v25";
+const projectVoicePatchVersion = "chatgpt-native-project-voice-breakpoints-v27";
 
 function findNativeExistingThreadStartCallback(source, gate) {
   const escapeRegExp = (value) =>
@@ -94,38 +94,101 @@ function findNativeExistingThreadStartCallback(source, gate) {
   };
 }
 
-function nativeExistingThreadGateConditionFor(
-  gate,
-  counterKey,
-  clearLaunchPending,
-) {
-  const clearPending =
-    clearLaunchPending && gate.launchPendingVariable != null
-      ? gate.launchPendingVariable + " = false, "
-      : "";
+function findNativeExistingThreadHandoff(source, gateMatch, gate) {
+  if (gate.launchPendingVariable == null) return { matchCount: 0 };
+  const escapeRegExp = (value) =>
+    value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const prefixStart = Math.max(0, gateMatch.index - 1800);
+  const prefix = source.slice(prefixStart, gateMatch.index);
+  const launchPending = escapeRegExp(gate.launchPendingVariable);
+  const activeSessionPattern = new RegExp(
+    "let " +
+      launchPending +
+      "=[A-Za-z_$][\\w$]*,([A-Za-z_$][\\w$]*)=([A-Za-z_$][\\w$]*)" +
+      "\\.phase!==`inactive`[\\s\\S]{0,320}?\\?\\2:null," +
+      "([A-Za-z_$][\\w$]*)=" +
+      launchPending +
+      "\\?`inactive`:",
+    "g",
+  );
+  const activeSessionMatches = [...prefix.matchAll(activeSessionPattern)];
+  if (activeSessionMatches.length !== 1) {
+    return { matchCount: activeSessionMatches.length };
+  }
+  const activeSessionMatch = activeSessionMatches[0];
+  const activeSessionVariable = activeSessionMatch[1];
+  const snapshotVariable = activeSessionMatch[2];
+  const phaseVariable = activeSessionMatch[3];
+  const launchStatePattern = new RegExp(
+    escapeRegExp(snapshotVariable) +
+      "=[A-Za-z_$][\\w$]*\\([^)]*\\)," +
+      "([A-Za-z_$][\\w$]*)=[A-Za-z_$][\\w$]*\\(" +
+      "([A-Za-z_$][\\w$]*)\\),[A-Za-z_$][\\w$]*;",
+    "g",
+  );
+  const launchStateMatches = [...prefix.matchAll(launchStatePattern)];
+  if (launchStateMatches.length !== 1) {
+    return { matchCount: launchStateMatches.length };
+  }
+  const launchStateAtom = launchStateMatches[0][2];
+  const storePattern = new RegExp(
+    "([A-Za-z_$][\\w$]*)\\.get\\(" +
+      escapeRegExp(launchStateAtom) +
+      "\\)\\?\\.phase",
+    "g",
+  );
+  const storeMatches = [...gateMatch[0].matchAll(storePattern)];
+  if (storeMatches.length !== 1) return { matchCount: storeMatches.length };
+  const phaseNeedle =
+    phaseVariable + "=" + gate.launchPendingVariable + "?`inactive`:";
+  const phaseOffset = activeSessionMatch[0].lastIndexOf(phaseNeedle);
+  if (phaseOffset < 0) return { matchCount: 0 };
+  return {
+    activeSessionVariable,
+    breakpointOffset:
+      prefixStart + activeSessionMatch.index + phaseOffset,
+    launchStateAtom,
+    matchCount: 1,
+    phaseVariable,
+    snapshotVariable,
+    storeVariable: storeMatches[0][1],
+  };
+}
+
+function nativeExistingThreadGateConditionFor(gate, counterKey) {
   return (
-    "(" +
+    "(() => {" +
+    "if (" +
     gate.conversationIdVariable +
-    " != null && !" +
+    " == null) return false;" +
+    gate.existingThreadEnabledVariable +
+    " = true;" +
+    "if (!" +
     gate.isVoiceThreadVariable +
-    " && (" +
-    gate.existingThreadEnabledVariable +
-    " = true, " +
-    clearPending +
-    gate.availabilityVariable +
-    " = (" +
-    gate.newThreadStartVariable +
-    " != null || " +
-    gate.existingThreadEnabledVariable +
-    " && " +
-    gate.conversationIdVariable +
-    " != null) && " +
-    gate.voiceFeatureEnabledVariable +
-    " && navigator.mediaDevices?.getUserMedia != null && " +
-    "typeof RTCPeerConnection !== 'undefined', " +
+    ") {" +
+    gate.isVoiceThreadVariable +
+    " = true;" +
     "globalThis.__chatgptNativeVoiceCompatibilityState[" +
     JSON.stringify(counterKey) +
-    "] += 1), false)"
+    "] += 1;" +
+    "}" +
+    "if (" +
+    gate.launchPendingVariable +
+    " && " +
+    gate.activeSessionVariable +
+    " != null && " +
+    gate.activeSessionVariable +
+    ".phase !== 'inactive') {" +
+    gate.storeVariable +
+    ".set(" +
+    gate.launchStateAtom +
+    ", null);" +
+    gate.launchPendingVariable +
+    " = false;" +
+    "globalThis.__chatgptNativeVoiceCompatibilityState.existingThreadHandoffCompletions += 1;" +
+    "}" +
+    "return false;" +
+    "})()"
   );
 }
 
@@ -569,6 +632,7 @@ const projectVoiceInstallerSource = String.raw`
   const stateKey = "__chatgptNativeProjectVoicePatchState";
   const version = ${JSON.stringify(projectVoicePatchVersion)};
   const findNativeExistingThreadStartCallback = ${findNativeExistingThreadStartCallback.toString()};
+  const findNativeExistingThreadHandoff = ${findNativeExistingThreadHandoff.toString()};
   const nativeExistingThreadGateConditionFor = ${nativeExistingThreadGateConditionFor.toString()};
   const nativeExistingThreadStartConditionFor = ${nativeExistingThreadStartConditionFor.toString()};
   const progress = (step) => {
@@ -653,12 +717,6 @@ const projectVoiceInstallerSource = String.raw`
     }
     const existingThreadGateAsset = existingThreadGateMatches[0].asset;
     const existingThreadGateMatch = existingThreadGateMatches[0].match;
-    const existingThreadGateNeedle = "return ";
-    const existingThreadGateLocation = nativeSourceLocationAt(
-      existingThreadGateAsset.source,
-      existingThreadGateMatch.index +
-        existingThreadGateMatch[0].lastIndexOf(existingThreadGateNeedle),
-    );
     const availabilityVariable = existingThreadGateMatch[1];
     const newThreadStartVariable = existingThreadGateMatch[2];
     const existingThreadEnabledVariable = existingThreadGateMatch[3];
@@ -672,14 +730,14 @@ const projectVoiceInstallerSource = String.raw`
     const launchPendingMatches = [...existingThreadGatePrefix.matchAll(
       /let ([A-Za-z_$][\w$]*)=[A-Za-z_$][\w$]*,[A-Za-z_$][\w$]*=[A-Za-z_$][\w$]*\.phase!==\x60inactive\x60/g,
     )];
-    if (launchPendingMatches.length > 1) {
+    if (launchPendingMatches.length !== 1) {
       throw new Error(
-        "Expected at most one native existing-thread pending state, found " +
+        "Expected one native existing-thread pending state, found " +
           launchPendingMatches.length,
       );
     }
-    const launchPendingVariable = launchPendingMatches[0]?.[1] ?? null;
-    const nativeExistingThreadGate = {
+    const launchPendingVariable = launchPendingMatches[0][1];
+    const nativeExistingThreadGateBase = {
       availabilityVariable,
       conversationIdVariable,
       existingThreadEnabledVariable,
@@ -688,6 +746,25 @@ const projectVoiceInstallerSource = String.raw`
       newThreadStartVariable,
       voiceFeatureEnabledVariable,
     };
+    const existingThreadHandoff = findNativeExistingThreadHandoff(
+      existingThreadGateAsset.source,
+      existingThreadGateMatch,
+      nativeExistingThreadGateBase,
+    );
+    if (existingThreadHandoff.matchCount !== 1) {
+      throw new Error(
+        "Expected one native existing-thread Voice handoff, found " +
+          existingThreadHandoff.matchCount,
+      );
+    }
+    const nativeExistingThreadGate = {
+      ...nativeExistingThreadGateBase,
+      ...existingThreadHandoff,
+    };
+    const existingThreadGateLocation = nativeSourceLocationAt(
+      existingThreadGateAsset.source,
+      existingThreadHandoff.breakpointOffset,
+    );
     const existingThreadStartCallback = findNativeExistingThreadStartCallback(
       existingThreadGateMatch[0],
       nativeExistingThreadGate,
@@ -706,7 +783,6 @@ const projectVoiceInstallerSource = String.raw`
     const existingThreadGateCondition = nativeExistingThreadGateConditionFor(
       nativeExistingThreadGate,
       "existingThreadGateHits",
-      true,
     );
     const existingThreadStartCondition =
       nativeExistingThreadStartConditionFor(nativeExistingThreadGate);
@@ -781,7 +857,7 @@ const projectVoiceInstallerSource = String.raw`
       await contents.debugger.sendCommand("Debugger.enable");
       await contents.debugger.sendCommand("Runtime.evaluate", {
         expression:
-          "globalThis.__chatgptNativeVoiceCompatibilityState={existingThreadGateHits:0,existingThreadStartGateHits:0,pendingLaunchGateHits:0,coordinatorGateHits:0}",
+          "globalThis.__chatgptNativeVoiceCompatibilityState={existingThreadGateHits:0,existingThreadStartGateHits:0,existingThreadHandoffCompletions:0,pendingLaunchGateHits:0,coordinatorGateHits:0}",
         returnByValue: true,
       });
       return contents.debugger;
@@ -1641,16 +1717,30 @@ function runVoiceThreadFooterGateSelfTest() {
 
 function runNativeExistingThreadStartSelfTest() {
   const source =
-    "W=(a!=null||x&&n!=null)&&u&&navigator.mediaDevices?.getUserMedia!=null&&typeof RTCPeerConnection<`u`,G;t[39]!==x||t[40]!==n?(G=async()=>{H||O||!W||(U(!0),await(async()=>{try{if(x&&n!=null){await so(s,{locator:{conversationId:n,hostId:r},source:`composer_button_existing_thread`},p);return}await a?.()}catch(e){}})().finally(()=>{U(!1)}))},t[39]=x,t[40]=n,t[49]=G):G=t[49];return{isStartAvailable:W,isVoiceThread:v,startConversation:G}";
-  const gate = {
+    "function Bor({conversationId:n,executionTargetHostId:r}){let s=store(),w=local(),T=read(qm),E=read(Boe),D;D=n!=null;let O=D,k=T.phase!==`inactive`&&n!=null&&T.locator.conversationId===n&&T.locator.hostId===r?T:null,A=O?`inactive`:k?.phase??w.phase,H=false,W=(a!=null||x&&n!=null)&&u&&navigator.mediaDevices?.getUserMedia!=null&&typeof RTCPeerConnection<`u`,G;t[39]!==x||t[40]!==n?(G=async()=>{H||O||!W||(U(!0),await(async()=>{try{if(x&&n!=null){await so(s,{locator:{conversationId:n,hostId:r},source:`composer_button_existing_thread`},p);return}await a?.()}catch(e){s.get(Boe)?.phase}})().finally(()=>{U(!1)}))},t[39]=x,t[40]=n,t[49]=G):G=t[49];return{isStartAvailable:W,isVoiceThread:v,startConversation:G}}";
+  const gateBase = {
     availabilityVariable: "W",
     conversationIdVariable: "n",
     existingThreadEnabledVariable: "x",
     isVoiceThreadVariable: "v",
-    launchPendingVariable: null,
+    launchPendingVariable: "O",
     newThreadStartVariable: "a",
     voiceFeatureEnabledVariable: "u",
   };
+  const gateMatchIndex = source.indexOf("W=(");
+  const handoff = findNativeExistingThreadHandoff(
+    source,
+    { 0: source.slice(gateMatchIndex), index: gateMatchIndex },
+    gateBase,
+  );
+  assert.equal(handoff.matchCount, 1);
+  assert.equal(handoff.activeSessionVariable, "k");
+  assert.equal(handoff.launchStateAtom, "Boe");
+  assert.equal(handoff.phaseVariable, "A");
+  assert.equal(handoff.snapshotVariable, "T");
+  assert.equal(handoff.storeVariable, "s");
+  assert.equal(source.startsWith("A=O?", handoff.breakpointOffset), true);
+  const gate = { ...gateBase, ...handoff };
   const callback = findNativeExistingThreadStartCallback(source, gate);
   assert.equal(callback.matchCount, 1);
   assert.equal(callback.callbackVariable, "G");
@@ -1689,6 +1779,78 @@ function runNativeExistingThreadStartSelfTest() {
     1,
   );
 
+  const renderContext = {
+    Boe: "launch-state-atom",
+    O: true,
+    k: { phase: "active" },
+    n: "existing-thread-id",
+    s: {
+      set(atom, value) {
+        renderContext.clearedLaunchStates.push({ atom, value });
+      },
+    },
+    clearedLaunchStates: [],
+    v: false,
+    x: false,
+    globalThis: {
+      __chatgptNativeVoiceCompatibilityState: {
+        existingThreadGateHits: 0,
+        existingThreadHandoffCompletions: 0,
+      },
+    },
+  };
+  runInNewContext(
+    nativeExistingThreadGateConditionFor(gate, "existingThreadGateHits"),
+    renderContext,
+  );
+  assert.equal(renderContext.O, false);
+  assert.equal(renderContext.v, true);
+  assert.equal(renderContext.x, true);
+  assert.deepEqual(renderContext.clearedLaunchStates, [
+    { atom: "launch-state-atom", value: null },
+  ]);
+  assert.equal(
+    renderContext.globalThis.__chatgptNativeVoiceCompatibilityState
+      .existingThreadGateHits,
+    1,
+  );
+  assert.equal(
+    renderContext.globalThis.__chatgptNativeVoiceCompatibilityState
+      .existingThreadHandoffCompletions,
+    1,
+  );
+
+  const inactiveHandoffContext = {
+    ...renderContext,
+    O: true,
+    k: null,
+    clearedLaunchStates: [],
+    v: false,
+    x: false,
+    globalThis: {
+      __chatgptNativeVoiceCompatibilityState: {
+        existingThreadGateHits: 0,
+        existingThreadHandoffCompletions: 0,
+      },
+    },
+  };
+  inactiveHandoffContext.s = {
+    set(atom, value) {
+      inactiveHandoffContext.clearedLaunchStates.push({ atom, value });
+    },
+  };
+  runInNewContext(
+    nativeExistingThreadGateConditionFor(gate, "existingThreadGateHits"),
+    inactiveHandoffContext,
+  );
+  assert.equal(inactiveHandoffContext.O, true);
+  assert.deepEqual(inactiveHandoffContext.clearedLaunchStates, []);
+  assert.equal(
+    inactiveHandoffContext.globalThis.__chatgptNativeVoiceCompatibilityState
+      .existingThreadHandoffCompletions,
+    0,
+  );
+
   const newThreadContext = {
     ...context,
     W: false,
@@ -1710,7 +1872,7 @@ function runNativeExistingThreadStartSelfTest() {
     0,
   );
   console.log(
-    "Native existing-thread start self-test passed: a callback cached before installation is enabled at invocation time without changing new-thread starts.",
+    "Native existing-thread start self-test passed: an existing task is classified for active Voice controls, its completed overlay handoff clears the loading state, and a cached callback starts without changing new-thread starts.",
   );
 }
 
