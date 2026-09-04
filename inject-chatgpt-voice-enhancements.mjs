@@ -63,7 +63,33 @@ const projectVoiceRendererTemplate = readFileSync(
   new URL("./chatgpt-voice-renderer-enhancements.js", import.meta.url),
   "utf8",
 );
-const projectVoicePatchVersion = "chatgpt-native-project-voice-breakpoints-v27";
+const projectVoicePatchVersion = "chatgpt-native-project-voice-breakpoints-v31";
+
+function findNativeRealtimeTranscriptNotificationGate(source) {
+  const pattern = /handleRealtimeNotification\(([A-Za-z_$][\w$]*),([A-Za-z_$][\w$]*)\)\{if\(!\(this\.conversationId==null\|\|\2\.params\.threadId!==this\.conversationId\)\)switch\(\2\.method\)\{/g;
+  const matches = [...source.matchAll(pattern)];
+  if (matches.length !== 1) return { matchCount: matches.length };
+  const match = matches[0];
+  const breakpointNeedle = "switch(" + match[2] + ".method){";
+  return {
+    breakpointOffset: match.index + match[0].lastIndexOf(breakpointNeedle),
+    eventVariable: match[2],
+    matchCount: 1,
+    storeVariable: match[1],
+  };
+}
+
+function nativeRealtimeTranscriptConditionFor(gate) {
+  const event = gate.eventVariable;
+  return (
+    "((globalThis.__chatgptNativeVoiceTranscriptEvent?.(" +
+    event +
+    ".method," +
+    event +
+    ".params) === true && " +
+    "(globalThis.__chatgptNativeVoiceCompatibilityState.liveTranscriptNotifications += 1)), false)"
+  );
+}
 
 function findNativeExistingThreadStartCallback(source, gate) {
   const escapeRegExp = (value) =>
@@ -631,6 +657,8 @@ const projectVoiceInstallerSource = String.raw`
   const path = appRequire("node:path");
   const stateKey = "__chatgptNativeProjectVoicePatchState";
   const version = ${JSON.stringify(projectVoicePatchVersion)};
+  const findNativeRealtimeTranscriptNotificationGate = ${findNativeRealtimeTranscriptNotificationGate.toString()};
+  const nativeRealtimeTranscriptConditionFor = ${nativeRealtimeTranscriptConditionFor.toString()};
   const findNativeExistingThreadStartCallback = ${findNativeExistingThreadStartCallback.toString()};
   const findNativeExistingThreadHandoff = ${findNativeExistingThreadHandoff.toString()};
   const nativeExistingThreadGateConditionFor = ${nativeExistingThreadGateConditionFor.toString()};
@@ -702,6 +730,25 @@ const projectVoiceInstallerSource = String.raw`
             : fs.readFileSync(path.join(assetsPath, name), "utf8"),
         url: "app://-/assets/" + name,
       }));
+    const realtimeTranscriptMatches = nativeRendererAssets.flatMap((asset) => {
+      const gate = findNativeRealtimeTranscriptNotificationGate(asset.source);
+      return gate.matchCount === 1 ? [{ asset, gate }] : [];
+    });
+    if (realtimeTranscriptMatches.length !== 1) {
+      throw new Error(
+        "Expected one native realtime transcript dispatcher, found " +
+          realtimeTranscriptMatches.length,
+      );
+    }
+    const realtimeTranscriptAsset = realtimeTranscriptMatches[0].asset;
+    const realtimeTranscriptGate = realtimeTranscriptMatches[0].gate;
+    const realtimeTranscriptLocation = nativeSourceLocationAt(
+      realtimeTranscriptAsset.source,
+      realtimeTranscriptGate.breakpointOffset,
+    );
+    const realtimeTranscriptCondition = nativeRealtimeTranscriptConditionFor(
+      realtimeTranscriptGate,
+    );
     const existingThreadGatePattern = /([A-Za-z_$][\w$]*)=\(([A-Za-z_$][\w$]*)!=null\|\|([A-Za-z_$][\w$]*)&&([A-Za-z_$][\w$]*)!=null\)&&([A-Za-z_$][\w$]*)&&navigator\.mediaDevices\?\.getUserMedia!=null&&typeof RTCPeerConnection<\x60u\x60[\s\S]{0,4200}?return[\s\S]{0,500}?\{isStartAvailable:\1,isSubmitStarting:[\s\S]{0,220}?isVoiceThread:([A-Za-z_$][\w$]*),/g;
     const existingThreadGateMatches = nativeRendererAssets.flatMap((asset) =>
       [...asset.source.matchAll(existingThreadGatePattern)].map((match) => ({
@@ -857,7 +904,7 @@ const projectVoiceInstallerSource = String.raw`
       await contents.debugger.sendCommand("Debugger.enable");
       await contents.debugger.sendCommand("Runtime.evaluate", {
         expression:
-          "globalThis.__chatgptNativeVoiceCompatibilityState={existingThreadGateHits:0,existingThreadStartGateHits:0,existingThreadHandoffCompletions:0,pendingLaunchGateHits:0,coordinatorGateHits:0}",
+          "globalThis.__chatgptNativeVoiceCompatibilityState={liveTranscriptNotifications:0,existingThreadGateHits:0,existingThreadStartGateHits:0,existingThreadHandoffCompletions:0,pendingLaunchGateHits:0,coordinatorGateHits:0}",
         returnByValue: true,
       });
       return contents.debugger;
@@ -877,11 +924,18 @@ const projectVoiceInstallerSource = String.raw`
     };
     let existingThreadVoiceLocation = null;
     let existingThreadVoiceStartLocation = null;
+    let liveTranscriptLocation = null;
     let pendingLaunchLocation = null;
     let coordinatorLocations = [];
     try {
       const mainDebugger = await attach(mainWindow.webContents, "the main window");
       const overlayDebugger = await attach(overlayWindow.webContents, "the avatar overlay");
+      liveTranscriptLocation = await installSourceBreakpoint(
+        overlayDebugger,
+        realtimeTranscriptAsset.url,
+        realtimeTranscriptLocation,
+        realtimeTranscriptCondition,
+      );
       existingThreadVoiceLocation = await installSourceBreakpoint(
         mainDebugger,
         existingThreadGateAsset.url,
@@ -965,6 +1019,11 @@ const projectVoiceInstallerSource = String.raw`
           version: state.version,
           breakpoints: state.breakpointIds.length,
           nativeCapabilities: true,
+          liveTranscript: {
+            enabled: true,
+            location: liveTranscriptLocation,
+            presentation: "live-thread-panel",
+          },
           voiceModelPicker: { enabled: true, location: null },
           coordinatorLocations,
           existingThreadVoice: {
@@ -1477,6 +1536,7 @@ async function main() {
     runOverrideSelfTest();
     runVoiceWindowReadinessSelfTest();
     runVoiceThreadFooterGateSelfTest();
+    runNativeRealtimeTranscriptSelfTest();
     runNativeExistingThreadStartSelfTest();
     await runExistingThreadVoiceGateSelfTest();
     await runProjectVoiceRendererSelfTest();
@@ -1561,6 +1621,9 @@ async function main() {
         "Installed Voice dynamic tools: Appshots, speak_to_user, end_realtime_voice_call.",
       );
       console.log("Installed native Voice launch for ordinary existing tasks.");
+      if (projectVoiceState.liveTranscript?.enabled) {
+        console.log("Installed the live Voice transcript in the conversation thread.");
+      }
     } else {
       console.log("Dynamic project Voice routing is disabled; native Voice remains untouched.");
     }
@@ -1712,6 +1775,75 @@ function runVoiceThreadFooterGateSelfTest() {
   );
   console.log(
     "Voice footer gate self-test passed: Voice threads retain native footer controls and Voice takes precedence over Resume when both actions are available.",
+  );
+}
+
+function runNativeRealtimeTranscriptSelfTest() {
+  const source =
+    "class Voice{handleRealtimeNotification(e,t){if(!(this.conversationId==null||t.params.threadId!==this.conversationId))switch(t.method){case`thread/realtime/started`:this.activate(e);break;case`thread/realtime/transcript/delta`:this.observe(t.params.delta);break}}}";
+  const gate = findNativeRealtimeTranscriptNotificationGate(source);
+  assert.equal(gate.matchCount, 1);
+  assert.equal(gate.eventVariable, "t");
+  assert.equal(gate.storeVariable, "e");
+  assert.equal(source.startsWith("switch(t.method){", gate.breakpointOffset), true);
+  assert.equal(
+    findNativeRealtimeTranscriptNotificationGate("const unrelated = true")
+      .matchCount,
+    0,
+  );
+
+  const notifications = [];
+  const acceptedTranscript = {
+    t: {
+      method: "thread/realtime/transcript/delta",
+      params: { threadId: "thread-1", role: "assistant", delta: "hello" },
+    },
+    globalThis: {
+      __chatgptNativeVoiceTranscriptEvent(method, params) {
+        notifications.push({ method, params });
+        return true;
+      },
+      __chatgptNativeVoiceCompatibilityState: {
+        liveTranscriptNotifications: 0,
+      },
+    },
+  };
+  runInNewContext(
+    nativeRealtimeTranscriptConditionFor(gate),
+    acceptedTranscript,
+  );
+  assert.deepEqual(notifications, [
+    {
+      method: "thread/realtime/transcript/delta",
+      params: { threadId: "thread-1", role: "assistant", delta: "hello" },
+    },
+  ]);
+  assert.equal(
+    acceptedTranscript.globalThis.__chatgptNativeVoiceCompatibilityState
+      .liveTranscriptNotifications,
+    1,
+  );
+
+  const unrelatedNotification = {
+    t: { method: "turn/started", params: { threadId: "thread-1" } },
+    globalThis: {
+      __chatgptNativeVoiceTranscriptEvent: () => false,
+      __chatgptNativeVoiceCompatibilityState: {
+        liveTranscriptNotifications: 0,
+      },
+    },
+  };
+  runInNewContext(
+    nativeRealtimeTranscriptConditionFor(gate),
+    unrelatedNotification,
+  );
+  assert.equal(
+    unrelatedNotification.globalThis.__chatgptNativeVoiceCompatibilityState
+      .liveTranscriptNotifications,
+    0,
+  );
+  console.log(
+    "Native realtime transcript self-test passed: accepted Voice notifications are forwarded to the display-only transcript hook.",
   );
 }
 
@@ -2189,8 +2321,75 @@ async function runProjectVoiceRendererSelfTest() {
       reasoningEffort: "xhigh",
     },
   });
+  const transcriptEvent = context.__chatgptNativeVoiceTranscriptEvent;
+  assert.equal(
+    transcriptEvent("thread/realtime/started", { threadId: "voice-thread" }),
+    true,
+  );
+  transcriptEvent("thread/realtime/transcript/delta", {
+    threadId: "voice-thread",
+    role: "user",
+    delta: "聞こえ",
+  });
+  transcriptEvent("thread/realtime/transcript/delta", {
+    threadId: "voice-thread",
+    role: "user",
+    delta: "ますか",
+  });
+  transcriptEvent("thread/realtime/transcript/done", {
+    threadId: "voice-thread",
+    role: "user",
+    text: "聞こえますか？",
+  });
+  transcriptEvent("thread/realtime/transcript/delta", {
+    threadId: "voice-thread",
+    role: "assistant",
+    delta: "はい、",
+  });
+  transcriptEvent("thread/realtime/transcript/done", {
+    threadId: "voice-thread",
+    role: "assistant",
+    text: "はい、聞こえています。",
+  });
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(state.liveTranscriptSnapshot())),
+    {
+      active: true,
+      entries: [
+        {
+          done: true,
+          id: "live-voice-1",
+          role: "user",
+          text: "聞こえますか？",
+        },
+        {
+          done: true,
+          id: "live-voice-2",
+          role: "assistant",
+          text: "はい、聞こえています。",
+        },
+      ],
+      threadId: "voice-thread",
+    },
+  );
+  assert.equal(
+    transcriptEvent("turn/started", { threadId: "voice-thread" }),
+    false,
+  );
+  transcriptEvent("thread/realtime/closed", {
+    threadId: "voice-thread",
+    reason: "user_ended",
+  });
+  assert.equal(state.liveTranscriptSnapshot().active, false);
+  assert.equal(scheduledTimeouts.at(-1).delay, 1500);
+  scheduledTimeouts.at(-1).callback();
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(state.liveTranscriptSnapshot())),
+    { active: false, entries: [], threadId: null },
+  );
   state.dispose();
   assert.equal(context.__chatgptNativeProjectVoiceContext, undefined);
+  assert.equal(context.__chatgptNativeVoiceTranscriptEvent, undefined);
   assert.equal(listeners.size, 0);
   assert.equal(context.setTimeout, originalSetTimeout);
   assert.equal(context.navigator.mediaDevices.getUserMedia, originalGetUserMedia);
