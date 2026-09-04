@@ -37,14 +37,16 @@ fi
 node "$INJECTOR" "$MAIN_INSPECT_PORT" 30000 --validate-only
 
 EXECUTABLE="$APP_PATH/Contents/MacOS/ChatGPT"
+launched_with_inspector=0
 main_pid="$(
   ps -axo pid=,command= |
     awk -v executable="$EXECUTABLE" '!found && $2 == executable { print $1; found = 1 }'
 )"
 
 if [[ -z "$main_pid" ]]; then
-  echo "ChatGPT is not running; launching it normally..."
-  open -na "$APP_PATH"
+  echo "ChatGPT is not running; launching it with a temporary main-process inspector..."
+  open -na "$APP_PATH" --args "--inspect=$MAIN_INSPECT_PORT"
+  launched_with_inspector=1
   for _ in {1..200}; do
     main_pid="$(
       ps -axo pid=,command= |
@@ -74,7 +76,9 @@ if [[ -n "$inspector_owner" && "$inspector_owner" != "$main_pid" ]]; then
   exit 1
 fi
 
-if [[ "$inspector_owner" != "$main_pid" ]]; then
+if [[ "$launched_with_inspector" -eq 1 ]]; then
+  echo "Waiting for the temporary main-process inspector on port $MAIN_INSPECT_PORT..."
+elif [[ "$inspector_owner" != "$main_pid" ]]; then
   echo "Opening a temporary main-process inspector on port $MAIN_INSPECT_PORT..."
   kill -USR1 "$main_pid"
 fi
@@ -105,7 +109,37 @@ case "$VOICE_WORKER_MODE" in
     echo "Installing pinned Voice worker $VOICE_WORKER_MODEL ($VOICE_WORKER_EFFORT reasoning)..."
     ;;
 esac
+set +e
 node "$INJECTOR" "$MAIN_INSPECT_PORT" 30000
+injector_status=$?
+set -e
+
+# The injector normally closes the inspector itself. If compatibility checks
+# fail before that cleanup is registered, close the temporary endpoint here.
+if [[ "$injector_status" -ne 0 ]]; then
+  node --input-type=module -e '
+    const port = process.argv[1];
+    try {
+      const targets = await (await fetch(`http://127.0.0.1:${port}/json/list`)).json();
+      const target = targets.find((item) => item.webSocketDebuggerUrl);
+      if (target) {
+        const socket = new WebSocket(target.webSocketDebuggerUrl);
+        await new Promise((resolve) => {
+          socket.addEventListener("open", () => socket.send(JSON.stringify({
+            id: 1,
+            method: "Runtime.evaluate",
+            params: { expression: "process._debugEnd(); true", returnByValue: true },
+          })));
+          socket.addEventListener("message", resolve);
+          socket.addEventListener("close", resolve);
+          socket.addEventListener("error", resolve);
+          setTimeout(resolve, 2000);
+        });
+      }
+    } catch {}
+  ' "$MAIN_INSPECT_PORT"
+  exit "$injector_status"
+fi
 
 for _ in {1..50}; do
   if ! lsof -nP -a -p "$main_pid" -iTCP:"$MAIN_INSPECT_PORT" -sTCP:LISTEN \

@@ -18,11 +18,12 @@ This is not a Sol/high model injector. The default mode follows the model and re
 ## Compatibility status
 
 - ChatGPT Desktop: `26.727.40816` build `6067`
+- Locally verified compatibility: `26.831.21537` build `7579` (uses the app's native project routing, existing-thread Voice, model picker, and dynamic-tool paths; the local injector unlocks the existing-thread rollout gates and retains the request hook and Voice-specific runtime tunings)
 - Bundled Codex: `0.146.0-alpha.9.2`
 - Worker request hook: `chatgpt-voice-worker-request-v6`
 - Project Voice context: `chatgpt-native-project-voice-context-v9`
-- Native project/model breakpoints: `chatgpt-native-project-voice-breakpoints-v18`
-- Runtime result: all eight breakpoints resolved in build `6067` on 2026-07-31, including the Voice coordinator and conversation-start boundary used for first-launch project/model routing. A fresh project Voice launch is still required to complete end-to-end verification.
+- Native project/model breakpoints: `chatgpt-native-project-voice-breakpoints-v25`
+- Runtime result: all five native-path breakpoints resolved in build `7579` on 2026-09-04. An existing text task completed a real Voice launch with live microphone and receive tracks, a connected WebRTC peer, and increasing inbound and outbound RTP packet counters.
 
 An app update can change the minified exports or launch schema. Revalidate before assuming compatibility with a newer build.
 
@@ -49,7 +50,7 @@ Run once after ChatGPT starts:
 ./install-chatgpt-voice-enhancements.sh
 ```
 
-The installer uses the running ChatGPT process. It does not quit or restart the app. It briefly opens the main-process inspector on port `9229`, installs the in-memory hooks, and closes the inspector.
+The installer uses a running ChatGPT process when one exists; otherwise it launches ChatGPT with a temporary main-process inspector. It never quits or restarts an already-running app. It briefly uses port `9229`, installs the in-memory hooks, and closes the inspector.
 
 After installation:
 
@@ -192,6 +193,7 @@ env -u CHATGPT_VOICE_WORKER_MODEL \
 The checks prove:
 
 - ordinary task starts remain unchanged;
+- a cold-start install waits for both ChatGPT Voice windows to finish loading;
 - Voice resumes remain unchanged;
 - per-chat mode preserves the Voice request produced from the composer selection;
 - explicit pin mode replaces only fresh Voice starts;
@@ -204,6 +206,7 @@ The checks prove:
 - the current minified compact-composer gate is uniquely identified before the native Voice picker breakpoint is installed.
 - the Voice-thread footer gate is uniquely identified and disabled only when `realtimeSession.isVoiceThread` is true.
 - the existing-thread Voice gate is uniquely identified, enabled only when a conversation ID exists, and leaves new-chat behavior unchanged.
+- an existing-thread start callback cached before installation is enabled when invoked, while a new-thread start remains unchanged.
 
 Self-tests are necessary but not sufficient after an app update. Final verification is one fresh Voice launch followed by checking that the task stayed in the selected project and that the provider received the selected model and reasoning effort.
 

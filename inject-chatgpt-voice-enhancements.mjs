@@ -30,11 +30,117 @@ const voiceDynamicTools = {
   speakToUserEnabled: process.env.CHATGPT_VOICE_SPEAK_TO_USER?.trim() !== "0",
 };
 const inspectorEndpoint = `http://127.0.0.1:${inspectorPort}/json/list`;
+const voiceWindowsReadyExpression = String.raw`
+(() => {
+  let appRequire = null;
+  if (typeof require === "function") {
+    appRequire = require;
+  } else if (typeof process.mainModule?.require === "function") {
+    appRequire = process.mainModule.require.bind(process.mainModule);
+  } else if (typeof process.getBuiltinModule === "function") {
+    const Module = process.getBuiltinModule("module");
+    appRequire = Module.createRequire(
+      process.resourcesPath + "/app.asar/package.json",
+    );
+  }
+  if (appRequire == null) return false;
+  const { BrowserWindow } = appRequire("electron");
+  const urls = BrowserWindow.getAllWindows()
+    .filter(
+      (window) =>
+        !window.webContents.isDestroyed() &&
+        !window.webContents.isLoadingMainFrame(),
+    )
+    .map((window) => window.webContents.getURL())
+    .filter((url) => url.startsWith("app://-/index.html"));
+  return (
+    urls.some((url) => !url.includes("initialRoute=%2Favatar-overlay")) &&
+    urls.some((url) => url.includes("initialRoute=%2Favatar-overlay"))
+  );
+})()
+`;
 const projectVoiceRendererTemplate = readFileSync(
   new URL("./chatgpt-voice-renderer-enhancements.js", import.meta.url),
   "utf8",
 );
-const projectVoicePatchVersion = "chatgpt-native-project-voice-breakpoints-v18";
+const projectVoicePatchVersion = "chatgpt-native-project-voice-breakpoints-v25";
+
+function findNativeExistingThreadStartCallback(source, gate) {
+  const escapeRegExp = (value) =>
+    value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const availability = escapeRegExp(gate.availabilityVariable);
+  const conversationId = escapeRegExp(gate.conversationIdVariable);
+  const existingThreadEnabled = escapeRegExp(
+    gate.existingThreadEnabledVariable,
+  );
+  const pattern = new RegExp(
+    "([A-Za-z_$][\\w$]*)=async\\(\\)=>\\{" +
+      "[A-Za-z_$][\\w$]*\\|\\|[A-Za-z_$][\\w$]*\\|\\|!" +
+      availability +
+      "\\|\\|\\([\\s\\S]{0,900}?if\\(" +
+      existingThreadEnabled +
+      "&&" +
+      conversationId +
+      "!=null\\)\\{[\\s\\S]{0,900}?source:`composer_button_existing_thread`",
+    "g",
+  );
+  const matches = [...source.matchAll(pattern)];
+  if (matches.length !== 1) return { matchCount: matches.length };
+  const match = matches[0];
+  return {
+    breakpointOffset: match.index + match[0].indexOf("{") + 1,
+    callbackVariable: match[1],
+    matchCount: 1,
+  };
+}
+
+function nativeExistingThreadGateConditionFor(
+  gate,
+  counterKey,
+  clearLaunchPending,
+) {
+  const clearPending =
+    clearLaunchPending && gate.launchPendingVariable != null
+      ? gate.launchPendingVariable + " = false, "
+      : "";
+  return (
+    "(" +
+    gate.conversationIdVariable +
+    " != null && !" +
+    gate.isVoiceThreadVariable +
+    " && (" +
+    gate.existingThreadEnabledVariable +
+    " = true, " +
+    clearPending +
+    gate.availabilityVariable +
+    " = (" +
+    gate.newThreadStartVariable +
+    " != null || " +
+    gate.existingThreadEnabledVariable +
+    " && " +
+    gate.conversationIdVariable +
+    " != null) && " +
+    gate.voiceFeatureEnabledVariable +
+    " && navigator.mediaDevices?.getUserMedia != null && " +
+    "typeof RTCPeerConnection !== 'undefined', " +
+    "globalThis.__chatgptNativeVoiceCompatibilityState[" +
+    JSON.stringify(counterKey) +
+    "] += 1), false)"
+  );
+}
+
+function nativeExistingThreadStartConditionFor(gate) {
+  return (
+    "(" +
+    gate.conversationIdVariable +
+    " != null && (" +
+    gate.existingThreadEnabledVariable +
+    " = true, " +
+    gate.availabilityVariable +
+    " = true, " +
+    "globalThis.__chatgptNativeVoiceCompatibilityState.existingThreadStartGateHits += 1), false)"
+  );
+}
 
 function findVoiceStartRequestFunction(source) {
   const pattern = /async function ([A-Za-z_$][\w$]*)\(([A-Za-z_$][\w$]*),([A-Za-z_$][\w$]*),([A-Za-z_$][\w$]*)\)\{let [A-Za-z_$][\w$]*=\2\.get\([^)]+\);if\([\s\S]{0,220}?\3\.source!==`composer_button_new_thread`\)[\s\S]{0,600}?\.requestRealtimeStart\(\3,/g;
@@ -462,6 +568,9 @@ const projectVoiceInstallerSource = String.raw`
   const path = appRequire("node:path");
   const stateKey = "__chatgptNativeProjectVoicePatchState";
   const version = ${JSON.stringify(projectVoicePatchVersion)};
+  const findNativeExistingThreadStartCallback = ${findNativeExistingThreadStartCallback.toString()};
+  const nativeExistingThreadGateConditionFor = ${nativeExistingThreadGateConditionFor.toString()};
+  const nativeExistingThreadStartConditionFor = ${nativeExistingThreadStartConditionFor.toString()};
   const progress = (step) => {
     globalThis.__chatgptVoiceInstallProgress = { step, version };
   };
@@ -490,6 +599,313 @@ const projectVoiceInstallerSource = String.raw`
   }
   const appInitialUrl = "app://-/assets/" + appInitialAsset;
   const appInitialSource = fs.readFileSync(path.join(assetsPath, appInitialAsset), "utf8");
+  const hasNativeVoiceRouting =
+    appInitialSource.includes("existingThreadVoiceEnabled") &&
+    appInitialSource.includes("realtimeVoiceDynamicTools") &&
+    appInitialSource.includes("newThreadReasoningEffort") &&
+    appInitialSource.includes("workspaceRootsForLocalExecution");
+  if (hasNativeVoiceRouting) {
+    const nativeSourceLocationAt = (source, offset) => {
+      const before = source.slice(0, offset);
+      const lastNewline = before.lastIndexOf("\n");
+      return {
+        lineNumber: before.split("\n").length - 1,
+        columnNumber: offset - lastNewline - 1,
+      };
+    };
+    const windows = BrowserWindow.getAllWindows().filter(
+      (window) =>
+        !window.webContents.isDestroyed() &&
+        window.webContents.getURL().startsWith("app://-/index.html"),
+    );
+    const mainWindow = windows.find(
+      (window) => !window.webContents.getURL().includes("initialRoute=%2Favatar-overlay"),
+    );
+    const overlayWindow = windows.find((window) =>
+      window.webContents.getURL().includes("initialRoute=%2Favatar-overlay"),
+    );
+    if (!mainWindow || !overlayWindow) {
+      throw new Error("ChatGPT main and avatar-overlay windows must both be loaded");
+    }
+    const nativeRendererAssets = fs
+      .readdirSync(assetsPath)
+      .filter((name) => /^app-(?:initial|primary)-[A-Za-z0-9_-]+[.]js$/.test(name))
+      .map((name) => ({
+        name,
+        source:
+          name === appInitialAsset
+            ? appInitialSource
+            : fs.readFileSync(path.join(assetsPath, name), "utf8"),
+        url: "app://-/assets/" + name,
+      }));
+    const existingThreadGatePattern = /([A-Za-z_$][\w$]*)=\(([A-Za-z_$][\w$]*)!=null\|\|([A-Za-z_$][\w$]*)&&([A-Za-z_$][\w$]*)!=null\)&&([A-Za-z_$][\w$]*)&&navigator\.mediaDevices\?\.getUserMedia!=null&&typeof RTCPeerConnection<\x60u\x60[\s\S]{0,4200}?return[\s\S]{0,500}?\{isStartAvailable:\1,isSubmitStarting:[\s\S]{0,220}?isVoiceThread:([A-Za-z_$][\w$]*),/g;
+    const existingThreadGateMatches = nativeRendererAssets.flatMap((asset) =>
+      [...asset.source.matchAll(existingThreadGatePattern)].map((match) => ({
+        asset,
+        match,
+      })),
+    );
+    if (existingThreadGateMatches.length !== 1) {
+      throw new Error(
+        "Expected one native existing-thread Voice gate, found " +
+          existingThreadGateMatches.length,
+      );
+    }
+    const existingThreadGateAsset = existingThreadGateMatches[0].asset;
+    const existingThreadGateMatch = existingThreadGateMatches[0].match;
+    const existingThreadGateNeedle = "return ";
+    const existingThreadGateLocation = nativeSourceLocationAt(
+      existingThreadGateAsset.source,
+      existingThreadGateMatch.index +
+        existingThreadGateMatch[0].lastIndexOf(existingThreadGateNeedle),
+    );
+    const availabilityVariable = existingThreadGateMatch[1];
+    const newThreadStartVariable = existingThreadGateMatch[2];
+    const existingThreadEnabledVariable = existingThreadGateMatch[3];
+    const conversationIdVariable = existingThreadGateMatch[4];
+    const voiceFeatureEnabledVariable = existingThreadGateMatch[5];
+    const isVoiceThreadVariable = existingThreadGateMatch[6];
+    const existingThreadGatePrefix = existingThreadGateAsset.source.slice(
+      Math.max(0, existingThreadGateMatch.index - 1800),
+      existingThreadGateMatch.index,
+    );
+    const launchPendingMatches = [...existingThreadGatePrefix.matchAll(
+      /let ([A-Za-z_$][\w$]*)=[A-Za-z_$][\w$]*,[A-Za-z_$][\w$]*=[A-Za-z_$][\w$]*\.phase!==\x60inactive\x60/g,
+    )];
+    if (launchPendingMatches.length > 1) {
+      throw new Error(
+        "Expected at most one native existing-thread pending state, found " +
+          launchPendingMatches.length,
+      );
+    }
+    const launchPendingVariable = launchPendingMatches[0]?.[1] ?? null;
+    const nativeExistingThreadGate = {
+      availabilityVariable,
+      conversationIdVariable,
+      existingThreadEnabledVariable,
+      isVoiceThreadVariable,
+      launchPendingVariable,
+      newThreadStartVariable,
+      voiceFeatureEnabledVariable,
+    };
+    const existingThreadStartCallback = findNativeExistingThreadStartCallback(
+      existingThreadGateMatch[0],
+      nativeExistingThreadGate,
+    );
+    if (existingThreadStartCallback.matchCount !== 1) {
+      throw new Error(
+        "Expected one native existing-thread Voice start callback, found " +
+          existingThreadStartCallback.matchCount,
+      );
+    }
+    const existingThreadStartLocation = nativeSourceLocationAt(
+      existingThreadGateAsset.source,
+      existingThreadGateMatch.index +
+        existingThreadStartCallback.breakpointOffset,
+    );
+    const existingThreadGateCondition = nativeExistingThreadGateConditionFor(
+      nativeExistingThreadGate,
+      "existingThreadGateHits",
+      true,
+    );
+    const existingThreadStartCondition =
+      nativeExistingThreadStartConditionFor(nativeExistingThreadGate);
+    const pendingLaunchGatePattern = /async function ([A-Za-z_$][\w$]*)\(([A-Za-z_$][\w$]*),([A-Za-z_$][\w$]*),[A-Za-z_$][\w$]*\)\{let ([A-Za-z_$][\w$]*)=\2\.get\([^)]+\);if\(\4!=null&&\4\.phase!==\x60failed\x60&&\3\.source!==\x60composer_button_new_thread\x60\)return;/g;
+    const pendingLaunchGateMatches = nativeRendererAssets.flatMap((asset) =>
+      [...asset.source.matchAll(pendingLaunchGatePattern)].map((match) => ({
+        asset,
+        match,
+      })),
+    );
+    if (pendingLaunchGateMatches.length !== 1) {
+      throw new Error(
+        "Expected one native pending Voice launch gate, found " +
+          pendingLaunchGateMatches.length,
+      );
+    }
+    const pendingLaunchGateAsset = pendingLaunchGateMatches[0].asset;
+    const pendingLaunchGateMatch = pendingLaunchGateMatches[0].match;
+    const pendingLaunchGateNeedle = "if(" + pendingLaunchGateMatch[4] + "!=null";
+    const pendingLaunchGateLocation = nativeSourceLocationAt(
+      pendingLaunchGateAsset.source,
+      pendingLaunchGateMatch.index +
+        pendingLaunchGateMatch[0].lastIndexOf(pendingLaunchGateNeedle),
+    );
+    const pendingRequestVariable = pendingLaunchGateMatch[3];
+    const pendingStateVariable = pendingLaunchGateMatch[4];
+    const pendingLaunchGateCondition =
+      "(" + pendingRequestVariable + ".source === 'composer_button_existing_thread' && (" +
+      pendingStateVariable + " = null, " +
+      "globalThis.__chatgptNativeVoiceCompatibilityState.pendingLaunchGateHits += 1), false)";
+    const coordinatorPattern = /async function ([A-Za-z_$][\w$]*)\(\{scope:[A-Za-z_$][\w$]*,activeCollaborationMode:[A-Za-z_$][\w$]*,activateRealtimeConversation:[A-Za-z_$][\w$]*,agentMode:[A-Za-z_$][\w$]*,currentLocalExecutionCwd:[A-Za-z_$][\w$]*,intent:[A-Za-z_$][\w$]*,memoryPreferences:[A-Za-z_$][\w$]*,onStartError:[A-Za-z_$][\w$]*,permissionProfileId:[A-Za-z_$][\w$]*,serviceTier:[A-Za-z_$][\w$]*,shouldSendPermissionOverrides:[A-Za-z_$][\w$]*,threadToolsEnabled:[A-Za-z_$][\w$]*,treatment:([A-Za-z_$][\w$]*),workspaceRootsForLocalExecution:[A-Za-z_$][\w$]*\}\)\{try\{/g;
+    const coordinatorMatches = nativeRendererAssets.flatMap((asset) =>
+      [...asset.source.matchAll(coordinatorPattern)].map((match) => ({
+        asset,
+        match,
+      })),
+    );
+    if (coordinatorMatches.length !== 1) {
+      throw new Error(
+        "Expected one native Voice coordinator, found " + coordinatorMatches.length,
+      );
+    }
+    const coordinatorAsset = coordinatorMatches[0].asset;
+    const coordinatorMatch = coordinatorMatches[0].match;
+    const coordinatorLocation = nativeSourceLocationAt(
+      coordinatorAsset.source,
+      coordinatorMatch.index + coordinatorMatch[0].lastIndexOf("try{"),
+    );
+    const treatmentVariable = coordinatorMatch[2];
+    const coordinatorCondition =
+      "(" + treatmentVariable + " = { ..." + treatmentVariable +
+      ", existingThreadVoiceEnabled: true, dynamicTools: { ...(" + treatmentVariable +
+      ".dynamicTools ?? {}), ..." + JSON.stringify(voiceDynamicTools) + " } }, " +
+      "globalThis.__chatgptNativeVoiceCompatibilityState.coordinatorGateHits += 1, false)";
+    const results = [];
+    for (const window of [mainWindow, overlayWindow]) {
+      results.push(await window.webContents.executeJavaScript(rendererSource, true));
+    }
+    if (results.some((result) => result?.installed !== true)) {
+      throw new Error("Voice renderer tuning did not install: " + JSON.stringify(results));
+    }
+    const contextResult = results[0];
+    const attachments = [];
+    const breakpointIds = [];
+    const attach = async (contents, label) => {
+      if (contents.debugger.isAttached()) {
+        throw new Error("Cannot install native Voice compatibility; debugger already attached to " + label);
+      }
+      contents.debugger.attach("1.3");
+      attachments.push({ contents, label });
+      await contents.debugger.sendCommand("Runtime.enable");
+      await contents.debugger.sendCommand("Debugger.enable");
+      await contents.debugger.sendCommand("Runtime.evaluate", {
+        expression:
+          "globalThis.__chatgptNativeVoiceCompatibilityState={existingThreadGateHits:0,existingThreadStartGateHits:0,pendingLaunchGateHits:0,coordinatorGateHits:0}",
+        returnByValue: true,
+      });
+      return contents.debugger;
+    };
+    const installSourceBreakpoint = async (debuggerApi, url, location, condition) => {
+      const installed = await debuggerApi.sendCommand("Debugger.setBreakpointByUrl", {
+        url,
+        lineNumber: location.lineNumber,
+        columnNumber: location.columnNumber,
+        condition,
+      });
+      if (!Array.isArray(installed.locations) || installed.locations.length === 0) {
+        throw new Error("Native Voice compatibility breakpoint did not resolve");
+      }
+      breakpointIds.push({ debuggerApi, breakpointId: installed.breakpointId });
+      return installed.locations[0];
+    };
+    let existingThreadVoiceLocation = null;
+    let existingThreadVoiceStartLocation = null;
+    let pendingLaunchLocation = null;
+    let coordinatorLocations = [];
+    try {
+      const mainDebugger = await attach(mainWindow.webContents, "the main window");
+      const overlayDebugger = await attach(overlayWindow.webContents, "the avatar overlay");
+      existingThreadVoiceLocation = await installSourceBreakpoint(
+        mainDebugger,
+        existingThreadGateAsset.url,
+        existingThreadGateLocation,
+        existingThreadGateCondition,
+      );
+      existingThreadVoiceStartLocation = await installSourceBreakpoint(
+        mainDebugger,
+        existingThreadGateAsset.url,
+        existingThreadStartLocation,
+        existingThreadStartCondition,
+      );
+      pendingLaunchLocation = await installSourceBreakpoint(
+        mainDebugger,
+        pendingLaunchGateAsset.url,
+        pendingLaunchGateLocation,
+        pendingLaunchGateCondition,
+      );
+      coordinatorLocations = await Promise.all([
+        installSourceBreakpoint(
+          mainDebugger,
+          coordinatorAsset.url,
+          coordinatorLocation,
+          coordinatorCondition,
+        ),
+        installSourceBreakpoint(
+          overlayDebugger,
+          coordinatorAsset.url,
+          coordinatorLocation,
+          coordinatorCondition,
+        ),
+      ]);
+      await mainWindow.webContents.executeJavaScript(
+        "window.dispatchEvent(new Event('resize')); true",
+        true,
+      );
+    } catch (error) {
+      for (const item of breakpointIds.reverse()) {
+        await item.debuggerApi.sendCommand("Debugger.removeBreakpoint", {
+          breakpointId: item.breakpointId,
+        }).catch(() => {});
+      }
+      for (const attachment of attachments.reverse()) {
+        if (attachment.contents.debugger.isAttached()) attachment.contents.debugger.detach();
+      }
+      throw error;
+    }
+    const state = {
+      version,
+      installed: true,
+      attachments,
+      breakpointIds,
+      async restore() {
+        for (const item of [...state.breakpointIds].reverse()) {
+          await item.debuggerApi.sendCommand("Debugger.removeBreakpoint", {
+            breakpointId: item.breakpointId,
+          }).catch(() => {});
+        }
+        for (const attachment of [...state.attachments].reverse()) {
+          if (!attachment.contents.isDestroyed() && attachment.contents.debugger.isAttached()) {
+            attachment.contents.debugger.detach();
+          }
+        }
+        for (const window of BrowserWindow.getAllWindows()) {
+          if (window.webContents.isDestroyed()) continue;
+          await window.webContents.executeJavaScript(
+            "window.__chatgptNativeProjectVoiceContextState?.dispose?.(); true",
+            true,
+          ).catch(() => {});
+        }
+        state.installed = false;
+      },
+      publicState() {
+        return {
+          installed: state.installed,
+          inactivityTimeoutMs: contextResult.inactivityTimeoutMs ?? null,
+          voiceCaptureConstraints: contextResult.voiceCaptureConstraints ?? null,
+          voiceDynamicTools,
+          projectContext: contextResult.projectContext ?? null,
+          status: state.installed ? "ready" : "stopped",
+          version: state.version,
+          breakpoints: state.breakpointIds.length,
+          nativeCapabilities: true,
+          voiceModelPicker: { enabled: true, location: null },
+          coordinatorLocations,
+          existingThreadVoice: {
+            enabled: true,
+            presentation: "native",
+            uiLocation: existingThreadVoiceLocation,
+            startLocation: existingThreadVoiceStartLocation,
+            pendingLaunchLocation,
+          },
+        };
+      },
+    };
+    globalThis[stateKey] = state;
+    progress("native-capabilities-used");
+    progress("complete");
+    return state.publicState();
+  }
   const findVoiceThreadFooterGate = ${findVoiceThreadFooterGate.toString()};
   const findVoiceStartRequestFunction = ${findVoiceStartRequestFunction.toString()};
   const findVoiceIntentMapper = ${findVoiceIntentMapper.toString()};
@@ -983,7 +1399,9 @@ const projectVoiceCleanupSource = String.raw`
 async function main() {
   if (selfTest) {
     runOverrideSelfTest();
+    runVoiceWindowReadinessSelfTest();
     runVoiceThreadFooterGateSelfTest();
+    runNativeExistingThreadStartSelfTest();
     await runExistingThreadVoiceGateSelfTest();
     await runProjectVoiceRendererSelfTest();
     return;
@@ -1020,6 +1438,7 @@ async function main() {
     await waitForTargetRegistration(connection);
     let projectVoiceState = null;
     if (projectVoiceRoutingEnabled) {
+      await waitForVoiceWindows(connection);
       const projectVoiceEvaluation = await connection.send("Runtime.evaluate", {
         expression: projectVoiceInstallerSource,
         awaitPromise: true,
@@ -1049,9 +1468,13 @@ async function main() {
     }
     console.log("Wrapped only the registered message-from-view IPC handler; ordinary tasks and resumed Voice tasks remain untouched.");
     if (projectVoiceState) {
-      console.log(
-        `Installed dynamic project Voice routing for ${projectVoiceState.projectContext?.label ?? "the active project"}.`,
-      );
+      if (projectVoiceState.nativeCapabilities) {
+        console.log("Using ChatGPT's native project routing, existing-thread Voice, model picker, and dynamic tools.");
+      } else {
+        console.log(
+          `Installed dynamic project Voice routing for ${projectVoiceState.projectContext?.label ?? "the active project"}.`,
+        );
+      }
       console.log(
         `Installed fixed Voice inactivity timeout: ${projectVoiceState.inactivityTimeoutMs / 60000} minutes.`,
       );
@@ -1093,6 +1516,48 @@ async function main() {
     connection.close();
     activeConnection = null;
   }
+}
+
+function runVoiceWindowReadinessSelfTest() {
+  const windowFor = (url, loading = false) => ({
+    webContents: {
+      getURL: () => url,
+      isDestroyed: () => false,
+      isLoadingMainFrame: () => loading,
+    },
+  });
+  const mainWindow = windowFor("app://-/index.html");
+  const overlayWindow = windowFor(
+    "app://-/index.html?initialRoute=%2Favatar-overlay",
+  );
+  const contextFor = (windows) => ({
+    require: (specifier) => {
+      assert.equal(specifier, "electron");
+      return { BrowserWindow: { getAllWindows: () => windows } };
+    },
+  });
+  assert.equal(runInNewContext(voiceWindowsReadyExpression, contextFor([])), false);
+  assert.equal(
+    runInNewContext(voiceWindowsReadyExpression, contextFor([mainWindow])),
+    false,
+  );
+  assert.equal(
+    runInNewContext(
+      voiceWindowsReadyExpression,
+      contextFor([mainWindow, windowFor(overlayWindow.webContents.getURL(), true)]),
+    ),
+    false,
+  );
+  assert.equal(
+    runInNewContext(
+      voiceWindowsReadyExpression,
+      contextFor([mainWindow, overlayWindow]),
+    ),
+    true,
+  );
+  console.log(
+    "Cold-start readiness self-test passed: injection waits for both loaded ChatGPT windows.",
+  );
 }
 
 function runVoiceThreadFooterGateSelfTest() {
@@ -1171,6 +1636,81 @@ function runVoiceThreadFooterGateSelfTest() {
   );
   console.log(
     "Voice footer gate self-test passed: Voice threads retain native footer controls and Voice takes precedence over Resume when both actions are available.",
+  );
+}
+
+function runNativeExistingThreadStartSelfTest() {
+  const source =
+    "W=(a!=null||x&&n!=null)&&u&&navigator.mediaDevices?.getUserMedia!=null&&typeof RTCPeerConnection<`u`,G;t[39]!==x||t[40]!==n?(G=async()=>{H||O||!W||(U(!0),await(async()=>{try{if(x&&n!=null){await so(s,{locator:{conversationId:n,hostId:r},source:`composer_button_existing_thread`},p);return}await a?.()}catch(e){}})().finally(()=>{U(!1)}))},t[39]=x,t[40]=n,t[49]=G):G=t[49];return{isStartAvailable:W,isVoiceThread:v,startConversation:G}";
+  const gate = {
+    availabilityVariable: "W",
+    conversationIdVariable: "n",
+    existingThreadEnabledVariable: "x",
+    isVoiceThreadVariable: "v",
+    launchPendingVariable: null,
+    newThreadStartVariable: "a",
+    voiceFeatureEnabledVariable: "u",
+  };
+  const callback = findNativeExistingThreadStartCallback(source, gate);
+  assert.equal(callback.matchCount, 1);
+  assert.equal(callback.callbackVariable, "G");
+  assert.equal(
+    source.startsWith("H||O||!W", callback.breakpointOffset),
+    true,
+  );
+
+  const context = {
+    H: false,
+    O: false,
+    W: false,
+    existingStarts: 0,
+    n: "existing-thread-id",
+    newStarts: 0,
+    x: false,
+    globalThis: {
+      __chatgptNativeVoiceCompatibilityState: {
+        existingThreadStartGateHits: 0,
+      },
+    },
+  };
+  const condition = nativeExistingThreadStartConditionFor(gate);
+  runInNewContext(
+    condition +
+      "; H || O || !W || (x && n != null ? existingStarts++ : newStarts++);",
+    context,
+  );
+  assert.equal(context.W, true);
+  assert.equal(context.x, true);
+  assert.equal(context.existingStarts, 1);
+  assert.equal(context.newStarts, 0);
+  assert.equal(
+    context.globalThis.__chatgptNativeVoiceCompatibilityState
+      .existingThreadStartGateHits,
+    1,
+  );
+
+  const newThreadContext = {
+    ...context,
+    W: false,
+    existingStarts: 0,
+    n: null,
+    x: false,
+    globalThis: {
+      __chatgptNativeVoiceCompatibilityState: {
+        existingThreadStartGateHits: 0,
+      },
+    },
+  };
+  runInNewContext(condition, newThreadContext);
+  assert.equal(newThreadContext.W, false);
+  assert.equal(newThreadContext.x, false);
+  assert.equal(
+    newThreadContext.globalThis.__chatgptNativeVoiceCompatibilityState
+      .existingThreadStartGateHits,
+    0,
+  );
+  console.log(
+    "Native existing-thread start self-test passed: a callback cached before installation is enabled at invocation time without changing new-thread starts.",
   );
 }
 
@@ -1842,6 +2382,20 @@ async function waitForTargetRegistration(connection) {
     await delay(50);
   }
   throw new Error("Timed out waiting for ChatGPT's message-from-view IPC handler registration");
+}
+
+async function waitForVoiceWindows(connection) {
+  while (Date.now() < startupDeadline) {
+    const evaluated = await connection.send("Runtime.evaluate", {
+      expression: voiceWindowsReadyExpression,
+      returnByValue: true,
+    });
+    if (evaluated?.result?.value === true) return;
+    await delay(100);
+  }
+  throw new Error(
+    "Timed out waiting for ChatGPT's main and avatar-overlay windows to finish loading",
+  );
 }
 
 function openInspectorConnection(webSocketUrl) {

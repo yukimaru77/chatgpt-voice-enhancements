@@ -191,7 +191,7 @@ const expression = `
     for (const filename of fs.readdirSync(
       path.join(process.resourcesPath, "app.asar", "webview", "assets"),
     )) {
-      if (filename !== appInitialAsset) continue;
+      if (!filename.endsWith(".js")) continue;
       const source = fs.readFileSync(
         path.join(process.resourcesPath, "app.asar", "webview", "assets", filename),
         "utf8",
@@ -427,6 +427,71 @@ const expression = `
             }
             return found;
           };
+          const voiceFiberSummary = (element) => {
+            const fiberKey = Object.keys(element ?? {}).find((key) =>
+              key.startsWith("__reactFiber$") || key.startsWith("__reactContainer$"),
+            );
+            let fiber = fiberKey ? element[fiberKey] : null;
+            const found = [];
+            const interestingKey =
+              /voice|realtime|audio|microphone|\bmic\b|mute|phase|status|active|session|pending|connect/i;
+            const interestingState =
+              /^(inactive|starting|active|stopping|stopped|connecting|connected|reconnecting|disconnected|failed)$/i;
+            const summarize = (value, depth = 0, seen = new WeakSet()) => {
+              if (value == null || ["number", "boolean"].includes(typeof value)) {
+                return value;
+              }
+              if (typeof value === "string") return value.slice(0, 160);
+              if (typeof value !== "object") return typeof value;
+              if (seen.has(value) || depth >= 3) return "object";
+              seen.add(value);
+              if (Array.isArray(value)) {
+                return value.slice(0, 8).map((entry) =>
+                  summarize(entry, depth + 1, seen),
+                );
+              }
+              const output = {};
+              for (const [key, entry] of Object.entries(value)) {
+                if (!interestingKey.test(key)) continue;
+                output[key] = summarize(entry, depth + 1, seen);
+              }
+              return output;
+            };
+            for (let depth = 0; fiber && depth < 80; depth += 1, fiber = fiber.return) {
+              const component =
+                fiber.elementType?.displayName ?? fiber.elementType?.name ??
+                fiber.type?.displayName ?? fiber.type?.name ?? null;
+              for (const props of [fiber.memoizedProps, fiber.pendingProps]) {
+                if (!props || typeof props !== "object") continue;
+                for (const [key, value] of Object.entries(props)) {
+                  if (!interestingKey.test(key)) continue;
+                  found.push({
+                    depth,
+                    component,
+                    source: "props",
+                    key,
+                    value: summarize(value),
+                  });
+                }
+              }
+              let hook = fiber.memoizedState;
+              for (let hookIndex = 0; hook && hookIndex < 80; hookIndex += 1) {
+                const value = hook.memoizedState;
+                if (typeof value === "string" && interestingState.test(value)) {
+                  found.push({
+                    depth,
+                    component,
+                    source: "hook",
+                    key: String(hookIndex),
+                    value,
+                  });
+                }
+                hook = hook.next;
+              }
+              if (found.length >= 80) break;
+            }
+            return found.slice(0, 80);
+          };
           const resourceUrls = ["__CHATGPT_APP_INITIAL_URL__"].filter(
             (name) => name !== "null",
           ).concat(performance.getEntriesByType("resource")
@@ -563,18 +628,25 @@ const expression = `
               : null,
             nativeProjectVoiceBreakpointState:
               globalThis.__chatgptNativeProjectVoiceBreakpointState ?? null,
+            nativeVoiceCompatibilityState:
+              globalThis.__chatgptNativeVoiceCompatibilityState ?? null,
             voiceControls: [...document.querySelectorAll("button, [role=button]")]
               .map((element) => ({
                 tag: element.tagName,
                 ariaLabel: element.getAttribute("aria-label"),
                 title: element.getAttribute("title"),
+                disabled: "disabled" in element ? element.disabled : null,
                 text: (element.textContent ?? "").replace(/\\s+/g, " ").trim(),
+                fiber: voiceFiberSummary(element),
               }))
               .filter((control) =>
                 [control.ariaLabel, control.title, control.text]
                   .filter(Boolean)
-                  .some((value) => /voice/i.test(value)),
+                  .some((value) => /voice|audio|sound|microphone|音声|マイク/i.test(value)),
               ),
+            alerts: [...document.querySelectorAll('[role="alert"], [role="status"]')]
+              .map((element) => (element.textContent ?? "").replace(/\\s+/g, " ").trim())
+              .filter(Boolean),
             projectRows: [...document.querySelectorAll(
               "[data-app-action-sidebar-project-row]",
             )].slice(0, 30).map((element) => ({
@@ -613,6 +685,45 @@ const expression = `
         ),
         true,
       );
+      if (contents.debugger.isAttached()) {
+        const queryInstances = async (prototypeExpression, functionDeclaration) => {
+          const objectGroup = "chatgpt-voice-diagnosis-" + Date.now();
+          try {
+            const prototype = await contents.debugger.sendCommand("Runtime.evaluate", {
+              expression: prototypeExpression,
+              objectGroup,
+            });
+            if (!prototype?.result?.objectId || prototype.exceptionDetails) return [];
+            const queried = await contents.debugger.sendCommand("Runtime.queryObjects", {
+              prototypeObjectId: prototype.result.objectId,
+              objectGroup,
+            });
+            if (!queried?.objects?.objectId) return [];
+            const result = await contents.debugger.sendCommand("Runtime.callFunctionOn", {
+              objectId: queried.objects.objectId,
+              functionDeclaration,
+              returnByValue: true,
+            });
+            return result?.result?.value ?? [];
+          } catch (error) {
+            return { error: String(error) };
+          } finally {
+            await contents.debugger.sendCommand("Runtime.releaseObjectGroup", {
+              objectGroup,
+            }).catch(() => {});
+          }
+        };
+        renderer.liveMedia = {
+          streams: await queryInstances(
+            "MediaStream.prototype",
+            "function() { return Array.from(this).map((stream) => ({ active: stream.active, tracks: stream.getTracks().map((track) => { const settings = track.getSettings(); return { kind: track.kind, enabled: track.enabled, muted: track.muted, readyState: track.readyState, settings: { autoGainControl: settings.autoGainControl ?? null, echoCancellation: settings.echoCancellation ?? null, noiseSuppression: settings.noiseSuppression ?? null, sampleRate: settings.sampleRate ?? null, channelCount: settings.channelCount ?? null } }; }) })); }",
+          ),
+          peerConnections: await queryInstances(
+            "RTCPeerConnection.prototype",
+            "function() { return Array.from(this).map((peer) => ({ connectionState: peer.connectionState, iceConnectionState: peer.iceConnectionState, iceGatheringState: peer.iceGatheringState, signalingState: peer.signalingState, senders: peer.getSenders().map((sender) => sender.track ? { kind: sender.track.kind, enabled: sender.track.enabled, muted: sender.track.muted, readyState: sender.track.readyState } : null), receivers: peer.getReceivers().map((receiver) => receiver.track ? { kind: receiver.track.kind, enabled: receiver.track.enabled, muted: receiver.track.muted, readyState: receiver.track.readyState } : null) })); }",
+          ),
+        };
+      }
     } catch (error) {
       renderer = { error: String(error) };
     } finally {
