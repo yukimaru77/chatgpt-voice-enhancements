@@ -10,11 +10,13 @@
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { loadVoicePolicy } from "./voice-policy.mjs";
 
 const inspectorPort = Number.parseInt(process.argv[2] ?? "9333", 10);
 const assertExistingThreadVoice = process.argv.includes(
   "--assert-existing-thread-voice",
 );
+const assertVoicePolicy = process.argv.includes("--assert-voice-policy");
 const sourceSearchIndex = process.argv.indexOf("--search-app-source");
 const mainSourceSearchIndex = process.argv.indexOf("--search-main-source");
 const detachRendererDebuggers = process.argv.includes(
@@ -137,6 +139,7 @@ if (rendererTargets.length > 0) {
           : null,
         nativeVoiceCompatibilityState:
           globalThis.__chatgptNativeVoiceCompatibilityState ?? null,
+        voicePolicyState: globalThis.__chatgptVoicePolicyState ?? null,
         voiceControls: [...document.querySelectorAll("button, [role=button]")]
           .map((element) => ({
             ariaLabel: element.getAttribute("aria-label"),
@@ -152,11 +155,15 @@ if (rendererTargets.length > 0) {
       };
     })()
   `;
+  const policyOnlyExpression = `({
+    nativeProjectVoiceContextState: { installed: globalThis.__chatgptNativeProjectVoiceContextState?.installed === true },
+    voicePolicyState: globalThis.__chatgptVoicePolicyState ?? null
+  })`;
   const windows = await Promise.all(
     rendererTargets.map(async (target) => ({
       title: target.title,
       url: target.url,
-      renderer: await evaluateRendererTarget(target, rendererExpression),
+      renderer: await evaluateRendererTarget(target, assertVoicePolicy ? policyOnlyExpression : rendererExpression),
     })),
   );
   const daemonStatePath = join(
@@ -189,7 +196,19 @@ if (rendererTargets.length > 0) {
       : null,
     windows,
   };
-  if (assertExistingThreadVoice) {
+  if (assertVoicePolicy) {
+    const expected = loadVoicePolicy();
+    if (!expected.enabled || !daemonAlive || daemon?.state?.installed !== true ||
+        daemon.state.voicePolicy?.installed !== true ||
+        daemon.state.voicePolicy.mode !== expected.mode ||
+        daemon.state.voicePolicy.revision !== expected.revision ||
+        windows.some(w => w.renderer?.nativeProjectVoiceContextState?.installed !== true)) {
+      throw new Error("The requested single-backend Voice policy is not fully installed");
+    }
+    console.log(JSON.stringify({installed:true,mode:expected.mode,revision:expected.revision,
+      lastSessionBoundaries:windows.map(w=>w.renderer.voicePolicyState).filter(Boolean),
+      note:"Installation and boundary counters are not proof of model compliance; use a real voice test."},null,2));
+  } else if (assertExistingThreadVoice) {
     const installedRenderers = windows.filter(
       (window) =>
         window.renderer?.nativeProjectVoiceContextState?.installed === true,

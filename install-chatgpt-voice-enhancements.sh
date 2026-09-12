@@ -36,6 +36,7 @@ fi
 
 export CHATGPT_VOICE_WORKER_MODEL="$VOICE_WORKER_MODEL"
 export CHATGPT_VOICE_WORKER_EFFORT="$VOICE_WORKER_EFFORT"
+export CHATGPT_APP_PATH="$APP_PATH"
 
 if [[ ! -d "$APP_PATH" ]]; then
   echo "ChatGPT app not found at: $APP_PATH" >&2

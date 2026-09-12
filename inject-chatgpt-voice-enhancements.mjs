@@ -12,6 +12,7 @@
  */
 
 import { execFileSync, spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
   closeSync,
   mkdirSync,
@@ -25,11 +26,19 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import assert from "node:assert/strict";
 import { runInNewContext } from "node:vm";
+import {
+  loadVoicePolicy,
+  readAppInitialAsset,
+  voiceCoordinatorPolicyExpression,
+  voicePolicyAnalysisSource,
+} from "./voice-policy.mjs";
 
 const inspectorPort = Number.parseInt(process.argv[2] ?? "9333", 10);
 const startupDeadline = Date.now() + Number.parseInt(process.argv[3] ?? "30000", 10);
 const validateOnly = process.argv.includes("--validate-only");
 const selfTest = process.argv.includes("--self-test");
+const checkAppCompatibility = process.argv.includes("--check-app-compatibility");
+const voicePolicy = loadVoicePolicy();
 const rendererDaemon = process.argv.includes("--renderer-daemon");
 const projectVoiceRoutingEnabled =
   process.env.CHATGPT_PROJECT_VOICE_ROUTING?.trim() !== "0";
@@ -73,7 +82,12 @@ const projectVoiceRendererTemplate = readFileSync(
   new URL("./chatgpt-voice-renderer-enhancements.js", import.meta.url),
   "utf8",
 );
-const projectVoicePatchVersion = "chatgpt-native-project-voice-breakpoints-v32";
+const projectVoicePatchVersion = "chatgpt-native-project-voice-breakpoints-v34";
+const runtimeRevision = createHash("sha256")
+  .update(readFileSync(fileURLToPath(import.meta.url)))
+  .update(readFileSync(new URL("./voice-policy.mjs", import.meta.url)))
+  .update(projectVoiceRendererTemplate)
+  .digest("hex");
 const rendererDaemonDirectory = join(
   homedir(),
   "Library",
@@ -125,22 +139,27 @@ function findNativeExistingThreadVoiceOpenGuard(source) {
 }
 
 function findNativeVoiceCoordinator(source) {
-  const pattern = /async function ([A-Za-z_$][\w$]*)\(\{scope:[A-Za-z_$][\w$]*,activeCollaborationMode:[A-Za-z_$][\w$]*,activateRealtimeConversation:[A-Za-z_$][\w$]*,agentMode:[A-Za-z_$][\w$]*,currentLocalExecutionCwd:[A-Za-z_$][\w$]*,intent:[A-Za-z_$][\w$]*,memoryPreferences:[A-Za-z_$][\w$]*,onStartError:[A-Za-z_$][\w$]*,permissionProfileId:[A-Za-z_$][\w$]*,(?:projectId:[A-Za-z_$][\w$]*,)?serviceTier:[A-Za-z_$][\w$]*,shouldSendPermissionOverrides:[A-Za-z_$][\w$]*,threadToolsEnabled:[A-Za-z_$][\w$]*,treatment:([A-Za-z_$][\w$]*),workspaceRootsForLocalExecution:[A-Za-z_$][\w$]*\}\)\{try\{/g;
-  const matches = [...source.matchAll(pattern)];
+  const pattern = /async\s+function\s+([A-Za-z_$][\w$]*)\s*\(\s*\{([^{}]{1,6000})\}\s*\)\s*\{\s*try\s*\{/g;
+  const fields = ["scope", "activateRealtimeConversation", "intent", "treatment", "threadToolsEnabled", "workspaceRootsForLocalExecution"];
+  const matches = [...source.matchAll(pattern)].filter(match =>
+    fields.every(field => new RegExp(`(?:^|,)\\s*${field}\\s*(?=:|,|$)`).test(match[2])),
+  );
   if (matches.length !== 1) return { matchCount: matches.length };
   const match = matches[0];
+  const treatment = /(?:^|,)\s*treatment\s*(?::\s*([A-Za-z_$][\w$]*))?\s*(?=,|$)/.exec(match[2]);
+  if (!treatment) return { matchCount: 0 };
   return {
-    breakpointOffset: match.index + match[0].lastIndexOf("try{"),
+    breakpointOffset: match.index + match[0].lastIndexOf("try"),
     functionName: match[1],
     matchCount: 1,
-    treatmentVariable: match[2],
+    treatmentVariable: treatment[1] ?? "treatment",
   };
 }
 
-function nativeVoiceCoordinatorConditionFor(coordinator, dynamicTools) {
+function nativeVoiceCoordinatorConditionFor(coordinator, dynamicTools, policyExpression = "") {
   const treatment = coordinator.treatmentVariable;
   return (
-    "(" +
+    "(() => { " +
     treatment +
     " = { ..." +
     treatment +
@@ -148,8 +167,8 @@ function nativeVoiceCoordinatorConditionFor(coordinator, dynamicTools) {
     treatment +
     ".dynamicTools ?? {}), ..." +
     JSON.stringify(dynamicTools) +
-    " } }, " +
-    "globalThis.__chatgptNativeVoiceCompatibilityState.coordinatorGateHits += 1, false)"
+    " } }; " + policyExpression +
+    " globalThis.__chatgptNativeVoiceCompatibilityState.coordinatorGateHits += 1; return false; })()"
   );
 }
 
@@ -1644,18 +1663,21 @@ async function waitForRendererTargets() {
           target.webSocketDebuggerUrl,
       );
       const main = pages.find((target) => rendererRoleForTarget(target) === "main");
-      if (main) return { main, pages };
+      const overlay = pages.find((target) => rendererRoleForTarget(target) === "overlay");
+      if (main && (!voicePolicy.enabled || overlay)) return { main, pages };
     } catch {}
     await delay(100);
   }
   throw new Error(
-    `Timed out waiting for ChatGPT's main renderer debugger target on port ${inspectorPort}; last target count: ${lastTargets.length}`,
+    `Timed out waiting for ChatGPT's ${voicePolicy.enabled ? "main and Voice overlay" : "main"} renderer targets on port ${inspectorPort}; last target count: ${lastTargets.length}`,
   );
 }
 
 function rendererVoiceSourceAnalysisExpressionFor(appInitialUrl) {
   return String.raw`
 (async () => {
+  ${voicePolicyAnalysisSource(voicePolicy)}
+  const voiceCoordinatorPolicyExpression = ${voiceCoordinatorPolicyExpression.toString()};
   const findNativeExistingThreadVoiceOpenGuard = ${findNativeExistingThreadVoiceOpenGuard.toString()};
   const findNativeVoiceCoordinator = ${findNativeVoiceCoordinator.toString()};
   const findNativeRealtimeTranscriptNotificationGate = ${findNativeRealtimeTranscriptNotificationGate.toString()};
@@ -1670,7 +1692,13 @@ function rendererVoiceSourceAnalysisExpressionFor(appInitialUrl) {
   const openGuard = findNativeExistingThreadVoiceOpenGuard(source);
   const coordinator = findNativeVoiceCoordinator(source);
   const transcript = findNativeRealtimeTranscriptNotificationGate(source);
+  const policyBoundary = voicePolicy.enabled ? findVoiceSessionBoundary(source) : null;
   return {
+    policySessionMatchCount: policyBoundary?.matchCount ?? null,
+    policySessionLocation: policyBoundary?.matchCount === 1
+      ? sourceLocationAt(source, policyBoundary.breakpointOffset) : null,
+    policySessionCondition: policyBoundary?.matchCount === 1
+      ? voiceSessionConditionFor(policyBoundary, voicePolicy) : null,
     hasNativeVoiceRouting:
       source.includes("existingThreadVoiceEnabled") &&
       source.includes("realtimeVoiceDynamicTools") &&
@@ -1691,6 +1719,7 @@ function rendererVoiceSourceAnalysisExpressionFor(appInitialUrl) {
         ? nativeVoiceCoordinatorConditionFor(
             coordinator,
             ${JSON.stringify(voiceDynamicTools)},
+            voiceCoordinatorPolicyExpression(coordinator.treatmentVariable, voicePolicy),
           )
         : null,
     transcriptCondition:
@@ -1718,6 +1747,9 @@ async function findLoadedAppInitialScriptUrl(connection) {
 }
 
 function validateRendererVoiceAnalysis(analysis) {
+  if (voicePolicy.enabled && analysis?.policySessionMatchCount !== 1) {
+    throw new Error("Single-backend Voice policy: expected exactly one compatible session-start boundary, found " + analysis?.policySessionMatchCount + ". No policy was installed; revalidate this app build.");
+  }
   if (!analysis?.hasNativeVoiceRouting) {
     throw new Error("This ChatGPT build does not expose the native Voice routing path");
   }
@@ -1809,10 +1841,16 @@ async function installRendererCdpVoiceEnhancements() {
     ...analysis.transcriptLocation,
     url: appInitialUrl,
   };
+  const policyBreakpoints = voicePolicy.enabled ? [{
+    condition: analysis.policySessionCondition,
+    label: "single-backend-voice-policy",
+    ...analysis.policySessionLocation,
+    url: appInitialUrl,
+  }] : [];
   const breakpointsForRole = (role) =>
     role === "main"
-      ? [coordinatorBreakpoint]
-      : [coordinatorBreakpoint, transcriptBreakpoint];
+      ? [coordinatorBreakpoint, ...policyBreakpoints]
+      : [coordinatorBreakpoint, transcriptBreakpoint, ...policyBreakpoints];
 
   const version = await (
     await fetch(`http://127.0.0.1:${inspectorPort}/json/version`)
@@ -1838,14 +1876,20 @@ async function installRendererCdpVoiceEnhancements() {
         (count, entry) => count + entry.breakpoints.length,
         0,
       ),
-      expectedBreakpointsWithOverlay: 3,
+      expectedBreakpointsWithOverlay: voicePolicy.enabled ? 5 : 3,
+      voicePolicy: {
+        mode: voicePolicy.mode,
+        revision: voicePolicy.revision,
+        installed: Boolean(main) && (!voicePolicy.enabled || main.breakpoints.some(b => b.label === "single-backend-voice-policy")),
+        enforcement: voicePolicy.enabled ? "prompts-and-native-transfer-flag" : "native",
+      },
       existingThreadVoice: {
         enabled: true,
         implementation: "treatment-flag",
         presentation: "native",
       },
       inactivityTimeoutMs: rendererResult?.inactivityTimeoutMs ?? 300000,
-      installed: Boolean(main),
+      installed: Boolean(main) && lastError == null,
       lastError,
       liveTranscript: {
         enabled: true,
@@ -1895,7 +1939,13 @@ async function installRendererCdpVoiceEnhancements() {
     };
     sessions.set(targetInfo.targetId, entry);
     entry.promise = (async () => {
-      await connection.send("Runtime.enable", {}, sessionId);
+      // Electron overlays can deadlock Runtime/Debugger initialization when
+      // auto-attached in a startup-paused state. Do not pause new targets.
+      // If another attachment left one waiting, release it before enabling
+      // either domain. Installation is reported only after hooks resolve.
+      if (waitingForDebugger) {
+        await connection.send("Runtime.runIfWaitingForDebugger", {}, sessionId);
+      }
       await connection.send("Debugger.enable", {}, sessionId);
       await connection.send("Page.enable", {}, sessionId);
       await connection.send(
@@ -1940,6 +1990,7 @@ async function installRendererCdpVoiceEnhancements() {
       if (waitingForDebugger) {
         await connection.send("Runtime.runIfWaitingForDebugger", {}, sessionId);
       }
+      await connection.send("Runtime.enable", {}, sessionId);
       if (role) {
         let renderer = null;
         const rendererDeadline = Date.now() + 15000;
@@ -2018,7 +2069,7 @@ async function installRendererCdpVoiceEnhancements() {
       autoAttach: true,
       filter: [{ type: "page", exclude: false }, { exclude: true }],
       flatten: true,
-      waitForDebuggerOnStart: true,
+      waitForDebuggerOnStart: false,
     });
     await delay(250);
     const currentTargets = await (await fetch(inspectorEndpoint)).json();
@@ -2045,6 +2096,8 @@ async function installRendererCdpVoiceEnhancements() {
     );
     if (!mainEntry) throw new Error("ChatGPT's main renderer was not attached");
     await mainEntry.promise;
+    await Promise.all([...sessions.values()].filter(entry => entry.role).map(entry => entry.promise));
+    if (lastError != null) throw new Error(lastError);
     return {
       connection,
       dispose: () => {
@@ -2066,6 +2119,9 @@ async function installRendererCdpVoiceEnhancements() {
 function rendererDaemonConfigKey() {
   return JSON.stringify({
     projectVoicePatchVersion,
+    runtimeRevision,
+    voicePolicyMode: voicePolicy.mode,
+    voicePolicyRevision: voicePolicy.revision,
     voiceDynamicTools,
     voiceWorkerMode,
   });
@@ -2129,6 +2185,8 @@ async function startRendererDaemon() {
   const existing = readRendererDaemonState();
   if (
     existing?.configKey === rendererDaemonConfigKey() &&
+    existing?.state?.installed === true &&
+    existing?.state?.lastError == null &&
     isManagedRendererDaemon(existing.daemonPid)
   ) {
     return { ...existing.state, reused: true };
@@ -2235,6 +2293,20 @@ async function main() {
     return;
   }
 
+  if (checkAppCompatibility || (validateOnly && voicePolicy.enabled)) {
+    const appPath = process.env.CHATGPT_APP_PATH ?? "/Applications/ChatGPT.app";
+    const asset = readAppInitialAsset(appPath);
+    const analysis = await runInNewContext(rendererVoiceSourceAnalysisExpressionFor("app://-/assets/" + asset.name), {
+      fetch: async () => ({ ok: true, text: async () => asset.source }),
+    });
+    validateRendererVoiceAnalysis(analysis);
+    const plist = `${appPath}/Contents/Info.plist`;
+    const appVersion = execFileSync("/usr/libexec/PlistBuddy", ["-c", "Print CFBundleShortVersionString", plist], { encoding: "utf8" }).trim();
+    const appBuild = execFileSync("/usr/libexec/PlistBuddy", ["-c", "Print CFBundleVersion", plist], { encoding: "utf8" }).trim();
+    console.log(JSON.stringify({ appVersion, appBuild, asset: asset.name, voicePolicy: voicePolicy.mode, policyRevision: voicePolicy.revision, compatible: true, policySessionMatchCount: analysis.policySessionMatchCount, coordinatorMatchCount: analysis.coordinatorMatchCount }));
+    if (checkAppCompatibility) return;
+  }
+
   if (validateOnly) {
     if (voiceWorkerMode === "inherit") {
       console.log(
@@ -2274,10 +2346,14 @@ async function main() {
     );
     console.log("Installed native Voice launch for ordinary existing tasks.");
     console.log("Installed the live Voice transcript in the conversation thread.");
+    console.log(`Voice policy: ${voicePolicy.mode}${voicePolicy.enabled ? " (same-thread work, faithful speech; model adherence is not a tool sandbox)" : ""}.`);
     console.log(
       "The renderer helper and loopback debugger remain active only until ChatGPT exits.",
     );
     return;
+  }
+  if (voicePolicy.enabled) {
+    throw new Error("Single-backend Voice policy requires the native renderer transport. This legacy build is unsupported; use CHATGPT_VOICE_POLICY=native only if you want the original behavior.");
   }
   const target = targets.find((candidate) => candidate.webSocketDebuggerUrl);
   if (!target) throw new Error("ChatGPT debugger endpoint did not expose a target");
@@ -2584,6 +2660,14 @@ function runNativeVoiceCoordinatorSelfTest() {
   );
   const previousSource = currentSource.replace("projectId:l,", "");
   assert.equal(findNativeVoiceCoordinator(previousSource).matchCount, 1);
+  const build8881Source = currentSource
+    .replace("projectId:l,", "pageCompanion:v,projectId:l,")
+    .replace("treatment:p,", "startupAnalytics:h,treatment:p,");
+  const build8881Coordinator = findNativeVoiceCoordinator(build8881Source);
+  assert.equal(build8881Coordinator.matchCount, 1);
+  assert.equal(build8881Coordinator.treatmentVariable, "p");
+  assert.equal(build8881Source.startsWith("try{", build8881Coordinator.breakpointOffset), true);
+  assert.equal(findNativeVoiceCoordinator(build8881Source + currentSource).matchCount, 2);
   assert.equal(findNativeVoiceCoordinator("const unrelated = true").matchCount, 0);
 
   const openGuardSource =
@@ -2637,6 +2721,7 @@ async function runRendererVoiceSourceAnalysisSelfTest() {
     "const guard={workspaceRoots:this.options.existingThreadVoiceEnabled?this.options.workspaceRootsForLocalExecution:[`/`]};if(!this.options.existingThreadVoiceEnabled&&kind!==`realtime_voice`)throw Error(`This thread is not a voice chat`);",
     "async function KHs({scope:a,activeCollaborationMode:b,activateRealtimeConversation:c,agentMode:d,currentLocalExecutionCwd:e,intent:f,memoryPreferences:g,onStartError:h,permissionProfileId:i,projectId:j,serviceTier:k,shouldSendPermissionOverrides:l,threadToolsEnabled:m,treatment:p,workspaceRootsForLocalExecution:q}){try{return p}catch(error){throw error}}",
     "class RealtimeStore{handleRealtimeNotification(store,event){if(!(this.conversationId==null||event.params.threadId!==this.conversationId))switch(event.method){case `thread/realtime/transcript/delta`:return store}}}",
+    "class Voice{async start(store,{prompt:p,realtimeStartInstructions:s,realtimeEndInstructions:e,conversationId:id,hostId:host,realtimeSessionOverrides:overrides,microphone:mic}){return [p,s,e]}}",
   ].join("\n");
   const context = {
     fetch: async () => ({
@@ -2658,6 +2743,14 @@ async function runRendererVoiceSourceAnalysisSelfTest() {
   assert.ok(result.transcriptLocation);
   assert.match(result.coordinatorCondition, /existingThreadVoiceEnabled/);
   assert.match(result.transcriptCondition, /liveTranscriptNotifications/);
+  validateRendererVoiceAnalysis(result);
+  if (voicePolicy.enabled) {
+    assert.equal(result.policySessionMatchCount, 1);
+    assert.ok(result.policySessionLocation);
+    assert.match(result.policySessionCondition, /__chatgptVoicePolicyState/);
+    assert.throws(() => validateRendererVoiceAnalysis({...result,policySessionMatchCount:0}), /session-start boundary/);
+    assert.throws(() => validateRendererVoiceAnalysis({...result,policySessionMatchCount:2}), /session-start boundary/);
+  }
   console.log(
     "Renderer source-analysis self-test passed: current Voice routing, coordinator, and transcript locations are discovered locally without transferring the app bundle.",
   );

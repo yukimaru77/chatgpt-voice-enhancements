@@ -2,8 +2,13 @@
 
 This package fixes project routing and unlocks the native controls and tools ChatGPT hides in Voice tasks. It also applies two Voice-only runtime tunings. It does not modify the signed app bundle.
 
+The default `single-backend` policy now routes everything beyond simple social acknowledgments to the current Codex thread, asks that thread to do all work without delegation, and instructs the voice model to convey the full backend answer with only minimal adjustments for natural speech. Runtime prompts are in English. This is a prompt policy, not a hard tool sandbox.
+
+**[日本語：目的 → Codex app のバージョンと構造 → 変更内容 → 実音声テスト](docs/single-backend-voice-ja.md)**
+
 | Capability | Change | Result |
 | --- | --- | --- |
+| Single-backend, faithful speech | Policy | Same-thread work; no independent substantive voice answers, summaries, or worker delegation. Opt out with `CHATGPT_VOICE_POLICY=native`. |
 | Project-aware Voice launch | Fix | A Voice task started from a selected project keeps that project's ID, working directory, workspace roots, and assignment instead of moving to `Documents/Codex/.../realtime-voice-chat-*`. |
 | Voice in any existing task | Unlock | An ordinary task that began with text can start and stop Voice later. ChatGPT attaches realtime Voice to the same thread ID instead of requiring a new Voice-first task. |
 | Per-task worker inheritance | Unlock | A fresh Voice task uses the Codex worker model and reasoning effort currently selected in the project's new-chat composer. It is no longer globally pinned to Sol/high or forced to the Voice rollout's Terra/low default. |
@@ -18,12 +23,14 @@ This is not a Sol/high model injector. The default mode follows the model and re
 
 ## Compatibility status
 
-- Current verified ChatGPT Desktop: `26.901.22334` build `7746`
-- Current bundled Codex: `0.153.0`
+- Current inspected and voice-tested ChatGPT Desktop: `26.908.40834` build `8881`
+- Current bundled Codex: `0.154.0-alpha.6.2`
+- Previously verified ChatGPT Desktop: `26.901.22334` build `7746`, bundled Codex `0.153.0`
 - Legacy verified ChatGPT Desktop: `26.831.21537` build `7579`
 - Worker request hook: `chatgpt-voice-worker-request-v6`
 - Project Voice context: `chatgpt-native-project-voice-context-v12`
-- Native project/model breakpoints: `chatgpt-native-project-voice-breakpoints-v32`
+- Native project/model/policy breakpoints: `chatgpt-native-project-voice-breakpoints-v34`
+- Voice policy tests on 2026-09-13: two synthesized WAV inputs, including one after a full app restart, passed through the actual app microphone/WebRTC path into the same existing text thread. Both backend turns read a local file and retained the session marker. The first final response matched the voice transcript after removal of the control prefix and whitespace; the second differed by one Japanese grammatical particle, without changing content. See the [Japanese report](docs/single-backend-voice-ja.md) for evidence and limitations.
 - Runtime result on 2026-09-04: an existing text task completed two real Voice start/stop cycles on build `7746`; ChatGPT logged successful `thread/realtime/start` and `thread/realtime/stop` calls for the same thread, including a connected GPT-Live WebRTC sideband. The user also confirmed working Voice input in the app.
 
 Build `7746` disables Electron's main-process inspector flags. This package therefore uses the app's loopback renderer debugger and one app-lifetime helper process on current builds. Build `7579` continues to use the older temporary main-process inspector path.
@@ -104,6 +111,7 @@ To return to per-chat selection, rerun the installer without those environment v
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
+| `CHATGPT_VOICE_POLICY` | `single-backend` | English same-thread work and faithful-speech instructions. `native` disables these new prompt overrides. |
 | `CHATGPT_APP_PATH` | `/Applications/ChatGPT.app` | ChatGPT Desktop application bundle. |
 | `CHATGPT_MAIN_INSPECT_PORT` | `9229` | Loopback renderer debugger port on current builds; temporary main-process inspector port on legacy builds. |
 | `CHATGPT_STARTUP_TIMEOUT_MS` | `90000` | Maximum time to wait for ChatGPT and its renderer to become ready. |
@@ -122,9 +130,9 @@ To return to per-chat selection, rerun the installer without those environment v
 
 Build `7746` already contains native project routing, composer-selected worker settings, the Voice model picker, and the existing-thread start path. The rollout treatment keeps part of that path disabled. The injector reads the loaded `app-initial` source inside the renderer, identifies exactly one native Voice coordinator and one realtime transcript dispatcher, and rejects the build if those signatures are ambiguous.
 
-The app-lifetime helper holds one coordinator breakpoint in the main window. While the avatar overlay exists, it holds the coordinator and transcript breakpoints there as well, for three total. A browser-level debugger connection pauses newly created page targets long enough to install those breakpoints before their app code runs. Closing the overlay reduces the active count to one; it does not terminate the helper, and a recreated overlay is attached automatically.
+The app-lifetime helper holds coordinator and Voice-session policy breakpoints in the main window. While the avatar overlay exists, it holds those plus the transcript breakpoint there, for five total. With `CHATGPT_VOICE_POLICY=native`, the original counts are one in the main window and three in total. New targets are not startup-paused, because that can deadlock Electron overlay initialization. Single-backend installation waits for both app windows and their hooks; start Voice after installation succeeds. Closing and recreating the overlay is supported.
 
-At the coordinator boundary the patch enables only `existingThreadVoiceEnabled` and merges the requested `realtimeVoiceDynamicTools`. It does not replace the selected project, model, reasoning effort, or unrelated treatment fields.
+At the coordinator boundary the patch enables `existingThreadVoiceEnabled` and merges the requested `realtimeVoiceDynamicTools`. The single-backend policy also replaces new-Voice worker-orchestration instructions and disables the new-task voice-transfer flag. At the session boundary it replaces `prompt`, `realtimeStartInstructions`, and `realtimeEndInstructions` before either call-ownership transport consumes them. It does not replace the selected project, model, reasoning effort, or unrelated treatment fields.
 
 ### 2. Preserve project and worker selection
 
@@ -176,6 +184,8 @@ On current builds the coordinator treatment breakpoint makes that native handler
 Run the deterministic checks without touching ChatGPT:
 
 ```bash
+node --test voice-policy.test.mjs
+node ./inject-chatgpt-voice-enhancements.mjs 9229 30000 --check-app-compatibility
 env -u CHATGPT_VOICE_WORKER_MODEL \
   -u CHATGPT_VOICE_WORKER_EFFORT \
   node ./inject-chatgpt-voice-enhancements.mjs \
@@ -206,6 +216,8 @@ For an installed current build, the read-only runtime assertion is:
 ```bash
 node ./diagnose-chatgpt-voice-enhancements.mjs \
   9229 --assert-existing-thread-voice
+node ./diagnose-chatgpt-voice-enhancements.mjs \
+  9229 --assert-voice-policy
 ```
 
 Self-tests are necessary but not sufficient after an app update. Final verification is one real Voice start/stop cycle in an existing text task, including visible live transcript and an enabled Stop control. That verification passed on build `7746` on 2026-09-04.
@@ -213,9 +225,12 @@ Self-tests are necessary but not sufficient after an app update. Final verificat
 ## Scope and limitations
 
 - This changes the Codex worker used by Voice, not the GPT-Live audio model.
+- The new routing and no-summary requirements are model instructions, not guaranteed semantic enforcement. Existing CLI subagent tools are not removed. The transfer flag controls newly created Voice tasks, not tools already registered on an existing thread.
+- Edited prompts apply on the next Voice start. Reinstalling does not rewrite an already-running voice model's context.
+- Unknown or ambiguous native session boundaries fail the compatibility check. The new policy requires the renderer transport; old main-inspector builds must explicitly use `CHATGPT_VOICE_POLICY=native`.
 - It does not change native dictation or its transcription service.
 - Dynamic composer inheritance is implemented for fresh Voice tasks launched from a selected project. A projectless Voice launch continues to use ChatGPT's own Voice defaults unless explicit pin mode is active.
-- The patch depends on current minified export names and React state shape.
+- The new policy discovers semantic parameter names instead of fixed minified identifiers, and checks for exactly one match. Other legacy/UI enhancements still depend on React state and app implementation details. A changed protocol still requires revalidation.
 - Fixed-model mode and `CHATGPT_PROJECT_VOICE_ROUTING=0` are unavailable on current protected builds.
 - The active Voice picker changes the Codex worker for subsequent handoffs, not a worker turn already in progress.
 - The existing-task Voice button appears only while the composer is empty and the task is not producing a response, matching ChatGPT's native action-control rules.
@@ -227,9 +242,11 @@ Self-tests are necessary but not sufficient after an app update. Final verificat
 - `install-chatgpt-voice-enhancements.sh` (required): validates configuration, safely launches or gracefully restarts ChatGPT when requested, and selects the debugger transport for the installed build.
 - `inject-chatgpt-voice-enhancements.mjs` (required): supervises current renderer targets or installs the legacy IPC/native Voice hooks; it also contains deterministic self-tests.
 - `chatgpt-voice-renderer-enhancements.js` (required): resolves project/composer state, applies the Voice-only timeout and microphone constraints, and renders the display-only live transcript.
+- `voice-policy.mjs` and `voice-policy/*.md` (required): semantic boundary detection, policy validation/revision tracking, and editable English runtime instructions.
+- `voice-policy.test.mjs` and `tests/` (development): deterministic policy checks and opt-in real-app synthetic-microphone smoke testing.
 - `diagnose-chatgpt-voice-enhancements.mjs` (optional): reports runtime state. Its mutation flags are development tools, not part of normal installation.
 
-The installer is not a self-contained single file. Keep the installer and its two required JavaScript files together. The diagnostic file can be omitted for normal use.
+The installer is not a self-contained single file. Keep it with all required JavaScript modules and the `voice-policy/` directory. The diagnostic and test files can be omitted for normal use.
 
 ## Diagnostics
 

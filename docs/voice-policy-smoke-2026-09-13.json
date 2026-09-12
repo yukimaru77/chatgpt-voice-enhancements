@@ -1,0 +1,125 @@
+{
+  "testDate": "2026-09-13",
+  "timezone": "Asia/Tokyo",
+  "app": {
+    "version": "26.908.40834",
+    "build": "8881",
+    "bundleIdentifier": "com.openai.codex",
+    "bundledCodex": "0.154.0-alpha.6.2",
+    "coldRestartPid": 95940
+  },
+  "policy": {
+    "mode": "single-backend",
+    "revision": "2c4fdfec2e9a505bab4838bb4f3e5828231d467b5409c7e064af47a6cea081b6",
+    "runtimeLanguage": "English",
+    "backendPromptObservedInRollout": 2,
+    "endPromptObservedInRollout": 2
+  },
+  "input": {
+    "type": "macOS Kyoko synthesized speech injected temporarily into app Voice getUserMedia",
+    "sampleRateHz": 48000,
+    "channels": 1,
+    "durationSeconds": 10.616916666666667,
+    "physicalMicrophoneTested": false
+  },
+  "sameExistingThread": true,
+  "substantiveHandoffs": 2,
+  "observedBackendToolCalls": [
+    {
+      "name": "exec",
+      "input": "text(await tools.exec_command({cmd:\"cat tests/voice-facts.txt\",workdir:\"/Users/nonaka/chatgpt-voice-enhancements\",max_output_tokens:2000}));\n"
+    },
+    {
+      "name": "exec",
+      "input": "text(await tools.exec_command({cmd:\"cat tests/voice-facts.txt\",workdir:\"/Users/nonaka/chatgpt-voice-enhancements\",max_output_tokens:2000}));\n"
+    }
+  ],
+  "observedSeparateWorkerCalls": 0,
+  "calls": [
+    {
+      "run": 1,
+      "afterColdRestart": false,
+      "sessionId": "fecce05f-7d2b-45dd-861b-2e57c28eab35",
+      "realtimeVersion": "v3",
+      "threadId": "01a0971f-05ff-7602-9b48-2ba9d8f584c8",
+      "policyBoundary": {
+        "mode": "single-backend",
+        "revision": "2c4fdfec2e9a505bab4838bb4f3e5828231d467b5409c7e064af47a6cea081b6",
+        "applications": 1,
+        "lastThreadId": "01a0971f-05ff-7602-9b48-2ba9d8f584c8",
+        "lastHostId": "local",
+        "boundary": "voice-session-start",
+        "frontendApplied": true,
+        "backendApplied": true,
+        "endApplied": true
+      },
+      "userTranscript": "準備したファイルの内容と、最初に覚えてもらった確認コードを教えてください。それから、十七かける二十三の答えも教えてください",
+      "backendFinalTimestamp": "2026-09-12T19:41:00.722Z",
+      "backendFinal": "[COMPLETE] ファイルの内容は次のとおりです。\n\n赤い箱には、青い玉が十三個と、白い玉が七個あります。\n集荷は火曜日の午後三時ですが、雨の場合は木曜日の午前十時になります。\n料金は千二百八十円で、送料は含まれますが、保険料は含まれません。\n到着日は確定していません。最短で金曜日ですが、月曜日になる可能性もあります。\n\n最初に覚えた確認コードは「QUARTZ-318」です。\n十七かける二十三の答えは、三百九十一です。",
+      "voiceFinal": "ファイルの内容は次のとおりです。赤い箱には、青い玉が十三個と、白い玉が七個あります。集荷は火曜日の午後三時ですが、雨の場合は木曜日の午前十時になります。料金は千二百八十円で、送料は含まれますが、保険料は含まれません。到着日は確定していません。最短で金曜日ですが、月曜日になる可能性もあります。最初に覚えた確認コードは「QUARTZ-318」です。十七かける二十三の答えは、三百九十一です。",
+      "exactAfterRemovingControlPrefixAndWhitespace": true,
+      "contentPreserved": true,
+      "onlyRemainingDifference": null,
+      "backendFileRead": {
+        "command": "cat tests/voice-facts.txt",
+        "exitCode": 0
+      },
+      "audio": {
+        "transport": "WebRTC connected",
+        "inputTotalAudioEnergy": 0.4418739800539633,
+        "outputTotalAudioEnergy": 0.8689671128706442,
+        "bytesSent": 133255,
+        "bytesReceived": 230326
+      },
+      "ended": true
+    },
+    {
+      "run": 2,
+      "afterColdRestart": true,
+      "sessionId": "822a5e11-8b7e-4686-996e-04a2a0b0658d",
+      "realtimeVersion": "v3",
+      "threadId": "01a0971f-05ff-7602-9b48-2ba9d8f584c8",
+      "policyBoundary": {
+        "mode": "single-backend",
+        "revision": "2c4fdfec2e9a505bab4838bb4f3e5828231d467b5409c7e064af47a6cea081b6",
+        "applications": 1,
+        "lastThreadId": "01a0971f-05ff-7602-9b48-2ba9d8f584c8",
+        "lastHostId": "local",
+        "boundary": "voice-session-start",
+        "frontendApplied": true,
+        "backendApplied": true,
+        "endApplied": true
+      },
+      "userTranscript": "準備したファイルの内容と、最初に覚えてもらった確認コードを教えてください。それから、十七かける二十三の答えも教えてください",
+      "backendFinalTimestamp": "2026-09-12T19:52:05.745Z",
+      "backendFinal": "[COMPLETE] ファイルの内容は次のとおりです。\n\n赤い箱には、青い玉が十三個と、白い玉が七個あります。\n集荷は火曜日の午後三時ですが、雨の場合は木曜日の午前十時になります。\n料金は千二百八十円で、送料は含まれますが、保険料は含まれません。\n到着日は確定していません。最短で金曜日ですが、月曜日になる可能性もあります。\n\n最初に覚えた確認コードは「QUARTZ-318」です。\n十七かける二十三の答えは、三百九十一です。",
+      "voiceFinal": " ファイルの内容は次のとおりです。赤い箱には、青い玉が十三個と、白い玉が七個あります。集荷は火曜日の午後三時ですが、雨の場合は木曜日午前十時になります。料金は千二百八十円で、送料は含まれますが、保険料は含まれません。到着日は確定していません。最短で金曜日ですが、月曜日になる可能性もあります。最初に覚えた確認コードは「QUARTZ-318」です。十七かける二十三の答えは、三百九十一です。",
+      "exactAfterRemovingControlPrefixAndWhitespace": false,
+      "contentPreserved": true,
+      "onlyRemainingDifference": "木曜日の午前十時 → 木曜日午前十時 (one grammatical particle; no factual content changed)",
+      "backendFileRead": {
+        "command": "cat tests/voice-facts.txt",
+        "exitCode": 0
+      },
+      "audio": {
+        "transport": "WebRTC connected",
+        "inputTotalAudioEnergy": 0.4558667012157515,
+        "outputTotalAudioEnergy": 1.8226103197293082,
+        "bytesSent": 486802,
+        "bytesReceived": 336119
+      },
+      "ended": true
+    }
+  ],
+  "cleanup": {
+    "callsEnded": true,
+    "testMicrophoneOverridesRestoredInBothRenderers": true,
+    "appLeftRunning": true
+  },
+  "limitations": [
+    "These two cases verify behavior, not guaranteed policy compliance for every request.",
+    "The no-delegation policy does not remove all backend tools.",
+    "Speech content was compared using native output transcripts; positive inbound audio energy verifies generated sound, not an independent phonetic transcription.",
+    "No physical input microphone was available; the real app and network used synthesized microphone audio."
+  ]
+}
