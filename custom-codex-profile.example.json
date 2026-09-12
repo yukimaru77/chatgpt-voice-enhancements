@@ -5,6 +5,7 @@
   "cliVersion": "0.153.4",
   "sourceCli": "/absolute/path/to/your/current/native/codex",
   "cliPath": "/absolute/path/to/pinned-build/codex",
+  "cliLauncher": null,
   "cliSha256": "REPLACE_WITH_SHA256_OF_YOUR_PINNED_CODEX",
   "codeModeHostSha256": "REPLACE_WITH_SHA256_OF_YOUR_PINNED_CODE_MODE_HOST",
   "debugPort": 9229

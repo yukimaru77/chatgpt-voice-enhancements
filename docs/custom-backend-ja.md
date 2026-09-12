@@ -26,9 +26,31 @@ node launch-custom-codex-app.mjs --status
 - ★ 起動前に固定した CLI と code-mode host のハッシュ、App のバージョン／ビルド、CLI の署名の整合性を検査します。署名検証の成功は、Chrome の接続で必要な署名 ID を持つことを意味しません。
 - `CODEX_CLI_PATH` と `CODEX_APP_SERVER_FORCE_CLI=1` を、そのアプリの起動だけに渡します。`.zshrc` や `launchctl` のグローバル環境は変更しません。
 - 別のバックエンドで起動中なら、アプリを前面に出して正常終了を要求します。終了確認は尊重し、キャンセルやタイムアウト時に強制終了しません。他の CLI セッションも終了しません。
-- 実際に起動したアプリの子プロセスが指定した `codex` かを確認し、Voice パッチを適用します。ディスク上の `--version` だけでは成功と判定しません。
+- 実際に起動したアプリから指定した `codex` までのプロセス関係を確認し、Voice パッチを適用します。ディスク上の `--version` だけでは成功と判定しません。
 
 App 更新後は、再検証するまでカスタム起動を拒否します。検査値を書き換えるだけでは再検証の代わりになりません。また、普段の CLI を更新しても固定コピーは自動更新されません。
+
+### CX のスレッド別プロファイルと併用する場合
+
+任意の `cliLauncher` に CX の `codex-app-server` ブリッジの絶対パスを指定できます。省略または `null` なら従来どおり固定 CLI を直接起動します。ブリッジ側も、同じ `cliPath` の固定 CLI を起動する設定にしてください。
+
+対応する CX では `--cli` で固定 CLI、`--app-launcher` でこのランチャーを呼ぶ実行ファイルを登録できます。これらの指定は保存されるため、以降は通常の `cx codex-app THREAD_ID PROFILE` を使えます。`--no-open` は登録だけを行い、既存の実行中 App を切り替えません。
+
+```bash
+cx codex-app THREAD_ID PROFILE --no-open \
+  --cli /absolute/path/to/pinned-build/codex \
+  --app-launcher /absolute/path/to/codex-app-custom
+```
+
+`codex-app-custom` は Node でこのスクリプトを実行する起動ファイルです。最初の切り替えは App の作業終了後に `cx codex-app THREAD_ID PROFILE --restart-app`、または App を終了して通常のコマンドを再実行します。
+
+この場合の起動順は **App → CX ブリッジ → 固定した改造 CLI** です。`CODEX_CLI_PATH` にはブリッジを渡しますが、ハッシュ・署名・バージョンの検査対象は引き続き固定 CLI です。アプリの直下に指定ブリッジがあり、その子に指定 CLI の `app-server` が 1 つあることを確認します。別の CLI セッションや、別のブリッジが生きているだけでは成功にしません。この構成ですでに起動済みなら、再実行してもそれだけを理由に再起動しません。
+
+`--status` の `effectiveCliPath`、`launchers`、`backends`、`customBackendMatches` で現在の接続先を確認できます。`--bundled` は `cliLauncher` を使わず、同梱 CLI を直接起動します。CX のプロファイルの内容や Voice に対する書き換えの効果を、このプロセス検査だけで確認したことにはしません。
+
+2026-09-13 の追加実機検証では、App 26.908.40834 / build 8881 → CX → 改造 CLI 0.153.4 の接続と、Voice の 5 箇所のパッチ適用、通常終了からの再起動を確認しました。既存のテスト会話に App の入力欄から送信し、`lab-professor` の基礎／開発者指示が実際に書き換わった監査記録、`monitor` が通知した `CX_MONITOR_OK`、元の確認コード `QUARTZ-318` を含む応答完了まで確認しています。対象の研究会話は開くだけにし、テスト発言は追加していません。
+
+CX の回帰テストは 134 件、Voice／プロセス判定は 11 件通過しました。実機で検出した `-c ... app-server` という引数順も回帰テストに含めています。この追加検証は通常入力であり、CX 併用での Realtime 音声や Chrome／Computer Use を再検証したものではありません。
 
 ## 同梱版へ戻す
 
