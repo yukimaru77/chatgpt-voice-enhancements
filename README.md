@@ -87,6 +87,21 @@ For a task that originally began with text, open the task and leave the composer
 
 Run the installer again after ChatGPT fully quits, restarts, crashes, or updates. The hooks are in memory and disappear with the ChatGPT process.
 
+## Optional custom CLI backend
+
+`launch-custom-codex-app.mjs` can launch the unchanged signed app with a pinned external native `codex` through `CODEX_CLI_PATH`, then apply the Voice enhancements. This is opt-in; the normal installer does not select a custom backend.
+
+The launcher checks binary hashes, the tested app version/build, and the actual app-server child process. Configuration stays outside the repository; see [the profile example](custom-codex-profile.example.json) and [Japanese setup and verification notes](docs/custom-backend-ja.md).
+
+```bash
+CHATGPT_CUSTOM_CODEX_PROFILE=/absolute/path/to/profile.json \
+  node launch-custom-codex-app.mjs
+```
+
+Use `--status` for a read-only process check or `--bundled` to select the bundled CLI. Respect any in-app quit confirmation when switching backends. The launcher does not re-sign the app, force-kill processes, or change the global launch environment. CLI binaries and personal profiles are not distributed here.
+
+The tested custom `0.153.4` build completed an actual Voice-to-native-`monitor` round trip on app build `8881`. **Chrome/Computer Use compatibility remains unresolved:** inventory retrieval succeeded, but signature rejection and native-pipe connection failures were also observed. The [verification record](docs/custom-backend-verification-2026-09-13.json) includes those limits and the interrupted first rollback attempt.
+
 ## Existing tasks
 
 An ordinary text-first task can now enter Voice without being recreated or moved. An existing Voice task retains the model and reasoning effort it was created with. The retained native picker can update those thread settings without creating another task. The change applies to subsequent worker turns; it does not replace a worker response already in progress and does not change the GPT-Live audio model.

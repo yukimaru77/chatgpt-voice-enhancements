@@ -1,0 +1,151 @@
+{
+  "date": "2026-09-13",
+  "appVersion": "26.908.40834",
+  "appBuild": "8881",
+  "bundledCliVersion": "0.154.0-alpha.6.2",
+  "customCliVersion": "0.153.4",
+  "customCliSha256": "2bf9852639cb9b1ff4238a41ea84d9620e4a806396e89132fb896a1e7294d1ad",
+  "appPid": 7091,
+  "backendPid": 7143,
+  "backendPath": "$HOME/.local/lib/codex-custom/0.153.4-2bf9852639cb/codex",
+  "connectionEvidence": [
+    "2026-09-12T20:27:54.752Z info [StdioConnection] stdio_transport_spawned argsCount=6 coreRuntimeInUse=false executablePath=$HOME/.local/lib/codex-custom/0.153.4-2bf9852639cb/codex pid=7143 spawnCommand=$HOME/.local/lib/codex-custom/0.153.4-2bf9852639cb/codex",
+    "2026-09-12T20:27:55.161Z info [AppServerConnection] Current reported app-server version: currentVersion=0.153.4 hostId=local",
+    "2026-09-12T20:27:55.161Z info [AppServerConnection] initialize_handshake_result durationMs=408 initializeRequestId=__codex_initialize__ outcome=success transportKind=stdio"
+  ],
+  "monitor": {
+    "call": "text(await tools.monitor({action:\"start\",command:\"sleep 2 && printf '確認完了\\\\n'\",description:\"二秒待機の動作確認\",interval_minutes:1}));\n",
+    "notification": "<monitor_notification>\n[二秒待機の動作確認] watcher exited (code 0)\n確認完了\n</monitor_notification>",
+    "backendFinal": "[COMPLETE] モニターの通知で実際に届いた文字列は「確認完了」です。最初に覚えた確認コードは「QUARTZ-318」です。",
+    "voiceFinal": "モニターの通知で実際に届いた文字列は「確認完了」です。最初に覚えた確認コードは「QUARTZ-318」です。",
+    "exactMatchAfterRemovingControlPrefix": true
+  },
+  "computerUse": {
+    "call": {
+      "code": "await cua.getState();",
+      "title": "利用可能なアプリとブラウザーの一覧を読み取り"
+    },
+    "inventorySucceeded": true,
+    "browserInventoryEmpty": true,
+    "fullChromeAndComputerUseNotVerified": true,
+    "signatureWarnings": [
+      "2026-09-12T20:27:59.233Z warning [dynamic-app-tools-native-pipe] dynamic_app_tools_peer_rejected reason=missing-code-signing-identity",
+      "2026-09-12T20:28:01.951Z warning [dynamic-app-tools-native-pipe] dynamic_app_tools_peer_rejected reason=missing-code-signing-identity",
+      "2026-09-12T20:28:04.472Z warning [dynamic-app-tools-native-pipe] dynamic_app_tools_peer_rejected reason=missing-code-signing-identity",
+      "2026-09-12T20:28:47.328Z warning [dynamic-app-tools-native-pipe] dynamic_app_tools_peer_rejected reason=missing-code-signing-identity",
+      "2026-09-12T20:29:47.372Z warning [dynamic-app-tools-native-pipe] dynamic_app_tools_peer_rejected reason=missing-code-signing-identity",
+      "2026-09-12T20:33:13.655Z warning [dynamic-app-tools-native-pipe] dynamic_app_tools_peer_rejected reason=missing-code-signing-identity",
+      "2026-09-12T20:33:13.664Z warning [browser-use-native-pipe-server] browser-use native pipe rejected socket peer reason=missing-code-signing-identity"
+    ],
+    "laterRootGetAppFailure": "Sky Computer Use native pipe startup failed"
+  },
+  "voice": {
+    "monitor": {
+      "threadId": "existing-test-thread",
+      "sessionId": "voice-monitor-session",
+      "policyRevision": "2c4fdfec2e9a505bab4838bb4f3e5828231d467b5409c7e064af47a6cea081b6",
+      "transcripts": [
+        {
+          "threadId": "existing-test-thread",
+          "role": "user",
+          "text": "動作確認です。モニターツールを実際に使って二秒待ってから確認完了と出力するシェルコマンドを監視してください。出力の通知が来たら実際に届いた文字列と最初に覚えた確認コードを教えてください、別のスレッドは使わないでください"
+        },
+        {
+          "threadId": "existing-test-thread",
+          "role": "assistant",
+          "text": "今、確認しますね。"
+        },
+        {
+          "threadId": "existing-test-thread",
+          "role": "assistant",
+          "text": "モニターの通知で実際に届いた文字列は「確認完了」です。最初に覚えた確認コードは「QUARTZ-318」です。"
+        }
+      ],
+      "audio": [
+        {
+          "connectionState": "connected",
+          "stats": [
+            {
+              "type": "inbound-rtp",
+              "bytesReceived": 214295,
+              "totalAudioEnergy": 0.7785166199567142
+            },
+            {
+              "type": "outbound-rtp",
+              "bytesSent": 195543
+            },
+            {
+              "type": "media-source",
+              "totalAudioEnergy": 0.808156757469387
+            }
+          ]
+        }
+      ]
+    },
+    "computer-use": {
+      "threadId": "existing-test-thread",
+      "sessionId": "voice-computer-use-session",
+      "policyRevision": "2c4fdfec2e9a505bab4838bb4f3e5828231d467b5409c7e064af47a6cea081b6",
+      "transcripts": [
+        {
+          "threadId": "existing-test-thread",
+          "role": "user",
+          "text": "続けて接続確認です。コンピューター操作用のツールで利用できるアプリやブラウザーの一覧を取得できるか、読み取りだけ試してください。アプリの中身の閲覧や操作、設定変更はしないでください。使えなければ、実際のエラーをそのまま教えてください"
+        },
+        {
+          "threadId": "existing-test-thread",
+          "role": "assistant",
+          "text": "少々お待ちください、確認します。"
+        },
+        {
+          "threadId": "existing-test-thread",
+          "role": "assistant",
+          "text": "[Redacted installed application names; the original transcript reported 14 apps, no browsers, and no UI operations.]"
+        }
+      ],
+      "audio": [
+        {
+          "connectionState": "connected",
+          "stats": [
+            {
+              "type": "inbound-rtp",
+              "bytesReceived": 303771,
+              "totalAudioEnergy": 1.3837497182265346
+            },
+            {
+              "type": "outbound-rtp",
+              "bytesSent": 221725
+            },
+            {
+              "type": "media-source",
+              "totalAudioEnergy": 0.8558420849787352
+            }
+          ]
+        }
+      ]
+    }
+  },
+  "physicalMicrophoneTested": false,
+  "synthesizedAudioInput": true,
+  "cleanup": {
+    "voiceCallsStopped": true,
+    "microphoneOverridesRestored": true
+  },
+  "rollbackTest": {
+    "completed": true,
+    "bundledAppPid": 10976,
+    "bundledBackendPid": 11012,
+    "bundledReportedVersion": "0.154.0-alpha.6.2",
+    "customAppPidAfterReturn": 11411,
+    "customBackendPidAfterReturn": 11439,
+    "customReportedVersionAfterReturn": "0.153.4",
+    "bothInitializeHandshakesSucceeded": true,
+    "bundledFlagUninterruptedEndToEnd": false,
+    "note": "The initial --bundled attempt encountered a quit confirmation and was canceled (-128). After app exit, normal official launch restored the bundled backend. The dedicated launcher then gracefully restarted it with the pinned custom backend. No force termination was used."
+  },
+  "publicationRedactions": [
+    "User home path replaced with $HOME.",
+    "Test thread and realtime-session IDs replaced with stable labels.",
+    "Installed application names omitted from the Computer Use output transcript."
+  ]
+}
