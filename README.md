@@ -28,7 +28,7 @@ This is not a Sol/high model injector. The default mode follows the model and re
 - Previously verified ChatGPT Desktop: `26.901.22334` build `7746`, bundled Codex `0.153.0`
 - Legacy verified ChatGPT Desktop: `26.831.21537` build `7579`
 - Worker request hook: `chatgpt-voice-worker-request-v6`
-- Project Voice context: `chatgpt-native-project-voice-context-v12`
+- Project Voice context: `chatgpt-native-project-voice-context-v15`
 - Native project/model/policy breakpoints: `chatgpt-native-project-voice-breakpoints-v34`
 - Voice policy tests on 2026-09-13: two synthesized WAV inputs, including one after a full app restart, passed through the actual app microphone/WebRTC path into the same existing text thread. Both backend turns read a local file and retained the session marker. The first final response matched the voice transcript after removal of the control prefix and whitespace; the second differed by one Japanese grammatical particle, without changing content. See the [Japanese report](docs/single-backend-voice-ja.md) for evidence and limitations.
 - Runtime result on 2026-09-04: an existing text task completed two real Voice start/stop cycles on build `7746`; ChatGPT logged successful `thread/realtime/start` and `thread/realtime/stop` calls for the same thread, including a connected GPT-Live WebRTC sideband. The user also confirmed working Voice input in the app.
@@ -81,7 +81,9 @@ After installation:
 6. While Voice is active, use the same model picker beside the speaker and microphone controls. A change updates the worker used by the next handoff; an already-running worker turn finishes on its original model.
 7. An otherwise idle Voice task remains open for five minutes. Transcript and worker activity reset that timer.
 8. New Voice microphone streams request `voiceIsolation`, `echoCancellation`, `noiseSuppression`, and `autoGainControl`; dictation streams are left unchanged.
-9. While Voice is active, the recognized conversation remains visible above the composer and updates continuously. User speech uses a bubble; ChatGPT speech uses the same gray-quote treatment as finalized Voice history.
+9. While Voice is active, unfinished speech appears above the composer and updates continuously, independently for each speaker. Once finalized, it is shown only in the native conversation history. User speech uses a bubble; ChatGPT speech uses the same gray-quote treatment as finalized Voice history.
+
+If a completed native reply contains only the beginning of a received final transcript, the renderer displays the complete text in its place when it can uniquely match the reply to the same user utterance. This repairs the current display only; it does not rewrite saved history. The replacement is removed when native history catches up.
 
 For a task that originally began with text, open the task and leave the composer empty while no response is running. The Voice button now appears. Starting Voice uses ChatGPT's native `composer_button_existing_thread` path and calls `thread/realtime/start` with that task's existing thread ID. Once the global Voice session accepts the handoff, the composer control changes from its loading ring to an enabled Stop button.
 
@@ -200,6 +202,7 @@ Run the deterministic checks without touching ChatGPT:
 
 ```bash
 node --test voice-policy.test.mjs
+node --test live-transcript.test.mjs
 node ./inject-chatgpt-voice-enhancements.mjs 9229 30000 --check-app-compatibility
 env -u CHATGPT_VOICE_WORKER_MODEL \
   -u CHATGPT_VOICE_WORKER_EFFORT \

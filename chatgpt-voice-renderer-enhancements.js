@@ -14,7 +14,7 @@
   const TRANSCRIPT_EVENT_KEY = "__chatgptNativeVoiceTranscriptEvent";
   const TRANSCRIPT_CHANNEL_NAME = "chatgpt-native-live-voice-transcript-v1";
   const TRANSCRIPT_ROOT_ATTRIBUTE = "data-chatgpt-live-voice-transcript";
-  const VERSION = "chatgpt-native-project-voice-context-v12";
+  const VERSION = "chatgpt-native-project-voice-context-v15";
   const VOICE_INACTIVITY_TIMEOUT_MS = 5 * 60 * 1000;
   const AUTO_END_CALLBACK_MARKER = "stopRealtimeForAutoEnd";
   const VOICE_CAPTURE_CONSTRAINTS = {
@@ -35,6 +35,7 @@
       version: VERSION,
     };
   }
+  const previousTranscript = previous?.liveTranscriptSnapshot?.();
   previous?.dispose?.();
 
   const originalSetTimeout = window.setTimeout;
@@ -209,10 +210,12 @@
       new URLSearchParams(location.search).get("initialRoute")?.split("?")[0] ===
         "/avatar-overlay");
   const liveTranscript = {
-    active: false,
-    entries: [],
-    nextEntryId: 1,
-    threadId: null,
+    active: previousTranscript?.active ?? false,
+    entries: previousTranscript?.entries ?? [],
+    nextEntryId: 1 + Math.max(0, ...(previousTranscript?.entries ?? []).map(
+      (entry) => Number(entry.id?.split("-").at(-1)) || 0,
+    )),
+    threadId: previousTranscript?.threadId ?? null,
   };
   let liveTranscriptRoot = null;
   let liveTranscriptCloseTimer = null;
@@ -276,6 +279,81 @@
       userText: style.color || "#ffffff",
     };
   };
+  const transcriptRepairs = new Map();
+  const normalizeTranscriptText = (text) => text.replace(/\s+/g, "");
+  const removeTranscriptRepair = (original, repair) => {
+    original.style.display = repair.display;
+    repair.replacement.remove();
+    transcriptRepairs.delete(original);
+  };
+  const repairNativeTranscripts = () => {
+    if (isAvatarOverlay) return;
+    const threadId = currentConversationId();
+    for (const [original, repair] of transcriptRepairs) {
+      if (!original.isConnected || threadId !== repair.threadId ||
+          original.textContent !== repair.originalText) {
+        removeTranscriptRepair(original, repair);
+      }
+    }
+    if (threadId == null || threadId !== liveTranscript.threadId) return;
+    for (const row of document.querySelectorAll(
+      '[data-content-search-unit-key^="realtime-voice:transcript:"]',
+    )) {
+      let fiber = fiberForElement(row);
+      let block = null;
+      for (let depth = 0; fiber && depth < 24; depth += 1, fiber = fiber.return) {
+        const props = fiber.memoizedProps;
+        if (props?.block?.entries && props.conversationId === threadId) {
+          block = props.block;
+          break;
+        }
+      }
+      if (!block) continue;
+      const key = row.getAttribute("data-content-search-unit-key");
+      const index = block.entries.findIndex((entry) => key.endsWith(`:${entry.id}`));
+      const native = block.entries[index];
+      if (native?.role !== "assistant" || native.completed !== true || !native.text?.trim()) continue;
+      const user = block.entries.slice(0, index).findLast((entry) => entry.role === "user");
+      if (!user) continue;
+      const prefix = normalizeTranscriptText(native.text);
+      const candidates = [];
+      let matchesUser = false;
+      for (const entry of liveTranscript.entries) {
+        if (entry.role === "user") {
+          matchesUser = entry.done && normalizeTranscriptText(entry.text) === normalizeTranscriptText(user.text);
+        } else if (matchesUser && entry.done) {
+          const full = normalizeTranscriptText(entry.text);
+          if (full.length > prefix.length && full.startsWith(prefix)) candidates.push(entry);
+        }
+      }
+      // Only repair an unambiguous truncated reply to the same user utterance.
+      if (candidates.length !== 1) continue;
+      const following = block.entries.slice(index);
+      const nextUser = following.findIndex((entry) => entry.role === "user");
+      const nativeReply = following.slice(0, nextUser < 0 ? undefined : nextUser)
+        .filter((entry) => entry.role === "assistant").map((entry) => entry.text).join("");
+      const original = row.querySelector('[data-markdown-text-style="assistant-message"]');
+      if (normalizeTranscriptText(nativeReply).includes(normalizeTranscriptText(candidates[0].text))) {
+        const repair = transcriptRepairs.get(original);
+        if (repair) removeTranscriptRepair(original, repair);
+        continue;
+      }
+      if (!original || transcriptRepairs.has(original)) continue;
+      const replacement = document.createElement("div");
+      replacement.setAttribute("data-chatgpt-voice-transcript-repair", "true");
+      replacement.textContent = candidates[0].text;
+      replacement.style.whiteSpace = "pre-wrap";
+      replacement.style.overflowWrap = "anywhere";
+      transcriptRepairs.set(original, {
+        display: original.style.display,
+        originalText: original.textContent,
+        replacement,
+        threadId,
+      });
+      original.style.display = "none";
+      original.parentElement.append(replacement);
+    }
+  };
   const createLiveTranscriptRoot = () => {
     if (typeof document.createElement !== "function") return null;
     const root = document.createElement("section");
@@ -298,13 +376,16 @@
   };
   const renderLiveTranscript = () => {
     if (isAvatarOverlay || typeof document.createElement !== "function") return;
+    repairNativeTranscripts();
+    // Completed transcripts belong to the app's native conversation history.
+    const pendingEntries = liveTranscript.entries.filter((entry) => !entry.done);
     const composer = document.querySelector?.("[data-codex-composer-root]");
     const composerParent = composer?.parentElement;
     const matchesVisibleConversation =
       liveTranscript.threadId != null &&
       currentConversationId() === liveTranscript.threadId;
     if (
-      liveTranscript.entries.length === 0 ||
+      pendingEntries.length === 0 ||
       !matchesVisibleConversation ||
       !composerParent
     ) {
@@ -320,7 +401,7 @@
     liveTranscriptRoot.dataset.active = String(liveTranscript.active);
     liveTranscriptRoot.replaceChildren();
     const colors = transcriptReferenceColors();
-    for (const entry of liveTranscript.entries) {
+    for (const entry of pendingEntries) {
       const row = document.createElement("div");
       row.dataset.liveVoiceRole = entry.role;
       row.dataset.liveVoiceFinal = String(entry.done);
@@ -379,9 +460,10 @@
     if (typeof delta !== "string" || delta.length === 0) return;
     ensureLiveTranscriptThread(threadId);
     const normalizedRole = role === "user" ? "user" : "assistant";
-    let entry = liveTranscript.entries.at(-1);
-    if (!entry || entry.done || entry.role !== normalizedRole) {
-      if (entry) entry.done = true;
+    let entry = liveTranscript.entries.findLast(
+      (candidate) => !candidate.done && candidate.role === normalizedRole,
+    );
+    if (!entry) {
       entry = {
         done: false,
         id: `live-voice-${liveTranscript.nextEntryId++}`,
@@ -396,9 +478,10 @@
   const finishLiveTranscriptEntry = (threadId, role, text) => {
     ensureLiveTranscriptThread(threadId);
     const normalizedRole = role === "user" ? "user" : "assistant";
-    let entry = liveTranscript.entries.at(-1);
-    if (!entry || entry.done || entry.role !== normalizedRole) {
-      if (entry) entry.done = true;
+    let entry = liveTranscript.entries.findLast(
+      (candidate) => !candidate.done && candidate.role === normalizedRole,
+    );
+    if (!entry) {
       entry = {
         done: false,
         id: `live-voice-${liveTranscript.nextEntryId++}`,
@@ -409,7 +492,9 @@
     }
     if (typeof text === "string" && text.length > 0) entry.text = text;
     entry.done = true;
-    if (entry.text.length === 0) liveTranscript.entries.pop();
+    if (entry.text.length === 0) {
+      liveTranscript.entries.splice(liveTranscript.entries.indexOf(entry), 1);
+    }
     renderLiveTranscript();
   };
   const closeLiveTranscript = () => {
@@ -431,6 +516,7 @@
   };
   const checkLiveTranscriptLifecycle = () => {
     lifecycleCheckScheduled = false;
+    repairNativeTranscripts();
     if (
       !liveTranscript.active ||
       liveTranscript.threadId == null ||
@@ -520,6 +606,7 @@
       attributes: true,
       attributeFilter: ["aria-label", "disabled"],
       childList: true,
+      characterData: true,
       subtree: true,
     });
   }
@@ -542,6 +629,7 @@
       liveTranscriptObserver?.disconnect?.();
       liveTranscriptObserver = null;
       removeLiveTranscript();
+      for (const [original, repair] of transcriptRepairs) removeTranscriptRepair(original, repair);
       if (window.setTimeout === voiceAwareSetTimeout) window.setTimeout = originalSetTimeout;
       if (mediaDevices?.getUserMedia === voiceAwareGetUserMedia) {
         mediaDevices.getUserMedia = originalGetUserMedia;
@@ -551,6 +639,7 @@
   };
   window[CONTEXT_KEY] = currentProjectContext;
   window[INSTALL_KEY] = state;
+  renderLiveTranscript();
   return {
     installed: true,
     inactivityTimeoutMs: VOICE_INACTIVITY_TIMEOUT_MS,
